@@ -1,0 +1,14 @@
+[package]
+name = "mock_xr_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mock_xr_runtime"
+crate-type = ["cdylib"]
+
+[dependencies]
+mock_xr_core = { path = "../mock_xr_core" }
+openxr-sys.workspace = true
+serde_json.workspace = true

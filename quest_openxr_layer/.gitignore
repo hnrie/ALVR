@@ -1,0 +1,20 @@
+# Cargo build artifacts (root ALVR .gitignore only ignores /target/ at repo root)
+/target/
+**/target/
+
+# Override root repo unanchored `dist` ignore so M3 dist artifacts can be tracked cleanly
+!/dist/
+
+# APK test/patched outputs and signing keystores
+dist/*.apk
+dist/*.idsig
+*.apk
+*.idsig
+*.jks
+*.keystore
+*.p12
+
+# Local scratch & editor backups
+*.tmp
+*.bak
+.DS_Store

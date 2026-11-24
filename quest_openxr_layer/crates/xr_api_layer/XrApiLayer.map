@@ -1,0 +1,7 @@
+{
+  global:
+    xrNegotiateLoaderApiLayerInterface;
+    xrInitializeLoaderKHR;
+  local:
+    *;
+};

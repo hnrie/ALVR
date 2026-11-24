@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "gestures": {
+    "only_touch": false,
+    "pinch_touch_distance": 0.0,
+    "pinch_trigger_distance": 0.25,
+    "curl_touch_distance": 2.0,
+    "curl_trigger_distance": 2.5,
+    "joystick_deadzone": 40.0,
+    "joystick_offset_horizontal": 0.0,
+    "joystick_offset_vertical": 0.0,
+    "joystick_range": 1.0,
+    "activation_delay": 50,
+    "deactivation_delay": 100,
+    "repeat_delay": 100
+  },
+  "pose": {
+    "mode": "meta_quest_native_grip",
+    "left_position_offset": [
+      0.04,
+      -0.02,
+      -0.13
+    ],
+    "left_rotation_offset_deg": [
+      0.0,
+      -45.0,
+      -90.0
+    ],
+    "aim_mode": "prefer_fb_aim",
+    "left_aim_position_offset": [
+      0.0,
+      -0.04,
+      -0.04
+    ],
+    "left_aim_rotation_offset_deg": [
+      -60.0,
+      0.0,
+      0.0
+    ]
+  },
+  "float_to_bool_threshold": 0.5,
+  "float_to_bool_hysteresis": 0.05,
+  "physical_controller_grace_ms": 250
+}

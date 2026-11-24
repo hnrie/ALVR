@@ -1,0 +1,25 @@
+[package]
+name = "android_packager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic Android .aar packager, binary AXML/ZIP OpenXR layer APK patcher, and ELF/AAR/APK inspector for Quest"
+
+[[bin]]
+name = "alvr-xr-packager"
+path = "src/main.rs"
+
+[dependencies]
+alvr_hand_core = { workspace = true }
+anyhow = { workspace = true }
+crc32fast = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+pico-args = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true }

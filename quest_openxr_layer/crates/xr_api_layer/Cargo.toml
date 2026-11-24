@@ -1,0 +1,19 @@
+[package]
+name = "xr_api_layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OpenXR 1.0/1.1 Implicit API Layer emulating Oculus/Meta Touch controllers from XR_EXT_hand_tracking using ALVR bindings"
+
+[lib]
+name = "XrApiLayer_alvr_hand_emulation"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+alvr_hand_core = { workspace = true }
+glam = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+openxr-sys = { workspace = true }
+parking_lot = { workspace = true }

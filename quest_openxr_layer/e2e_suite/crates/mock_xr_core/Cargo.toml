@@ -1,0 +1,13 @@
+[package]
+name = "mock_xr_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+libc.workspace = true
+openxr-sys.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
