@@ -4,7 +4,7 @@
 //! Strictly handles standard OpenXR API layer bundling, Quest hand-tracking manifest entries,
 //! page alignment, and v1/v2/v3 APK signing. Contains ZERO DRM, entitlement, or anti-cheat bypasses.
 
-use crate::axml::{patch_quest_hand_tracking_axml, AxmlPatchReport};
+use crate::axml::{patch_quest_hand_tracking_axml, rename_package_axml, AxmlPatchReport};
 use crate::inspect::{
     inspect_elf, validate_layer_manifest_json, EXPECTED_APK_SO_PATH, EXPECTED_LAYER_JSON_ASSET,
 };
@@ -30,6 +30,7 @@ pub struct PatchApkOptions<'a> {
     pub keystore_path: Option<&'a Path>,
     pub ks_pass: Option<&'a str>,
     pub ks_alias: Option<&'a str>,
+    pub package: Option<&'a str>,
     pub skip_sign: bool,
     pub allow_missing_loader: bool,
     pub allow_host_elf: bool,
@@ -161,8 +162,12 @@ pub fn patch_apk(opts: &PatchApkOptions<'_>) -> Result<PatchApkResult> {
         entry.read_to_end(&mut buf)?;
         buf
     };
-    let (patched_manifest, axml_report) = patch_quest_hand_tracking_axml(&orig_manifest)
+    let (mut patched_manifest, axml_report) = patch_quest_hand_tracking_axml(&orig_manifest)
         .context("failed to patch binary AndroidManifest.xml")?;
+    if let Some(newpkg) = opts.package {
+        patched_manifest = rename_package_axml(&patched_manifest, newpkg)
+            .context("failed to rename package in AndroidManifest.xml")?;
+    }
 
     // 4. Write new aligned APK cleanly to a temporary sibling file (supports input == output).
     if let Some(parent) = opts.output_apk.parent() {

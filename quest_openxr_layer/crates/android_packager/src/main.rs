@@ -22,7 +22,7 @@ USAGE:
   alvr-xr-packager package-aar --so <path> --manifest <path> --output <out.aar> [--config <json>] [--allow-host-elf]
   alvr-xr-packager patch-apk   --input <in.apk> --output <out.apk> --so <path> --manifest <path>
                                [--config <json>] [--keystore <ks>] [--ks-pass <pass>] [--ks-alias <alias>]
-                               [--skip-sign] [--allow-missing-loader] [--allow-host-elf]
+                               [--package <new.package.name>] [--skip-sign] [--allow-missing-loader] [--allow-host-elf]
   alvr-xr-packager inspect-apk --input <file.apk|file.aar> [--json]
 
 NOTE:
@@ -69,6 +69,7 @@ fn run() -> Result<()> {
             let keystore: Option<PathBuf> = args.opt_value_from_str("--keystore")?;
             let ks_pass: Option<String> = args.opt_value_from_str("--ks-pass")?;
             let ks_alias: Option<String> = args.opt_value_from_str("--ks-alias")?;
+            let package: Option<String> = args.opt_value_from_str("--package")?;
             let skip_sign = args.contains("--skip-sign");
             let allow_missing_loader = args.contains("--allow-missing-loader");
             let allow_host_elf = args.contains("--allow-host-elf");
@@ -86,6 +87,7 @@ fn run() -> Result<()> {
                 keystore_path: keystore.as_deref(),
                 ks_pass: ks_pass.as_deref(),
                 ks_alias: ks_alias.as_deref(),
+                package: package.as_deref(),
                 skip_sign,
                 allow_missing_loader,
                 allow_host_elf,

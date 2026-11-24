@@ -797,6 +797,68 @@ pub fn inspect_axml(bytes: &[u8]) -> Result<ManifestInspection, AxmlError> {
     Ok(out)
 }
 
+pub fn rename_package_axml(bytes: &[u8], newpkg: &str) -> Result<Vec<u8>, AxmlError> {
+    let oldpkg = inspect_axml(bytes)?
+        .package
+        .ok_or_else(|| AxmlError::Invalid("manifest has no package".into()))?;
+    let dotted = format!("{oldpkg}.");
+    let mut axml = parse_axml(bytes)?;
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for (ci, chunk) in axml.chunks.iter().enumerate() {
+        if chunk.chunk_type != RES_XML_START_ELEMENT_TYPE {
+            continue;
+        }
+        let hs = chunk.header_size as usize;
+        let tag = axml.get_str(read_u32(&chunk.data, hs + 4)?).unwrap_or("");
+        let start = read_u16(&chunk.data, hs + 8)? as usize;
+        let size = read_u16(&chunk.data, hs + 10)? as usize;
+        let count = read_u16(&chunk.data, hs + 12)? as usize;
+        for i in 0..count {
+            let off = hs + start + i * size;
+            if off + 20 > chunk.data.len() {
+                break;
+            }
+            let aname = axml.get_str(read_u32(&chunk.data, off + 4)?).unwrap_or("");
+            let idx = if chunk.data[off + 15] == ATTR_TYPE_STRING {
+                read_u32(&chunk.data, off + 16)?
+            } else {
+                read_u32(&chunk.data, off + 8)?
+            };
+            let Some(val) = axml.get_str(idx) else {
+                continue;
+            };
+            let hit = match aname {
+                "package" => tag == "manifest" && val == oldpkg,
+                "authorities" => val.contains(&oldpkg),
+                "permission" | "readPermission" | "writePermission" => val.starts_with(&dotted),
+                "name" => {
+                    matches!(
+                        tag,
+                        "permission"
+                            | "permission-tree"
+                            | "permission-group"
+                            | "uses-permission"
+                            | "uses-permission-sdk-23"
+                    ) && val.starts_with(&dotted)
+                }
+                _ => false,
+            };
+            if hit {
+                edits.push((ci, off, val.replace(&oldpkg, newpkg)));
+            }
+        }
+    }
+    for (ci, off, val) in edits {
+        let idx = axml.intern_plain_string(&val);
+        let chunk = &mut axml.chunks[ci];
+        write_u32(&mut chunk.data, off + 8, idx);
+        if chunk.data[off + 15] == ATTR_TYPE_STRING {
+            write_u32(&mut chunk.data, off + 16, idx);
+        }
+    }
+    Ok(serialize_axml(&axml))
+}
+
 /// Idempotently patches a binary `AndroidManifest.xml` (AXML) to declare Meta Quest + Khronos AOSP
 /// hand-tracking permissions, optional feature (`android:required="false"`), and Quest hand-tracking
 /// `<meta-data>` entries (`frequency=HIGH`, `version=V2.0`).
