@@ -1,0 +1,296 @@
+name: Quest OpenXR Layer & Desktop Patcher Release
+
+on:
+  push:
+    tags:
+      - "quest-layer-v*"
+  pull_request:
+    paths:
+      - "quest_openxr_layer/**"
+      - ".github/workflows/quest-openxr-layer-release.yml"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to create/update (e.g. quest-layer-v0.1.0)"
+        required: false
+        default: ""
+      publish_release:
+        description: "Publish artifacts to GitHub Releases"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-quest-layer:
+    name: Build Quest arm64-v8a Layer & Run Full 3-Tier E2E
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install native build & OpenXR loader dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            cmake ninja-build file \
+            libx11-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
+            libxi-dev libxcursor-dev libxrandr-dev libxxf86vm-dev libxinerama-dev
+
+      - name: Add Android AArch64 Rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Set up JDK 17 (for official Android SDK E2E cross-verification)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android NDK r26d
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Ensure Android SDK build-tools & platform jar for Tier 3 E2E verification
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "Using ANDROID_SDK_ROOT=${SDK_ROOT}"
+          if ! ls "${SDK_ROOT}"/build-tools/*/apksigner >/dev/null 2>&1 || ! ls "${SDK_ROOT}"/platforms/*/android.jar >/dev/null 2>&1; then
+            if [[ -x "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" ]]; then
+              set +o pipefail
+              yes | "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${SDK_ROOT}" \
+                "build-tools;35.0.0" "platforms;android-34" >/dev/null
+              set -o pipefail
+            fi
+          fi
+          ls -la "${SDK_ROOT}/build-tools" "${SDK_ROOT}/platforms"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "${GITHUB_ENV}"
+
+      - name: Run unit tests (alvr_hand_core, xr_api_layer, android_packager)
+        run: |
+          cargo test --manifest-path quest_openxr_layer/Cargo.toml \
+            -p alvr_hand_core -p xr_api_layer -p android_packager
+
+      - name: Build Quest arm64-v8a .so, host layer, pure-Rust CLI, and AAR
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: bash quest_openxr_layer/scripts/build_android.sh
+
+      - name: Run full 3-tier E2E suite (Direct OpenXR + Khronos 1.1.54 Loader + Official Android SDK)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: bash quest_openxr_layer/e2e_suite/run_e2e.sh
+
+      - name: Upload Quest layer dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quest-layer-dist
+          path: quest_openxr_layer/dist
+          if-no-files-found: error
+
+  build-desktop-gui:
+    name: Build Self-Contained Patcher (${{ matrix.label }})
+    needs: [build-quest-layer]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64
+            os: windows-latest
+            archive_name: alvr-quest-patcher-windows-x86_64.zip
+          - label: macos-universal
+            os: macos-14
+            archive_name: alvr-quest-patcher-macos-universal.zip
+          - label: linux-x86_64
+            os: ubuntu-24.04
+            archive_name: alvr-quest-patcher-linux-x86_64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download freshly built Quest arm64-v8a layer dist
+        uses: actions/download-artifact@v4
+        with:
+          name: quest-layer-dist
+          path: quest_openxr_layer/dist
+
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
+            libxi-dev libxcursor-dev libxrandr-dev libxxf86vm-dev libxinerama-dev
+
+      - name: Build & smoke-test Linux binaries
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --manifest-path quest_openxr_layer/Cargo.toml \
+            -p quest_patcher_gui -p android_packager
+          ./quest_openxr_layer/target/release/alvr-quest-patcher --self-test --self-test-report self_test.txt
+          cat self_test.txt
+          mkdir -p staging/alvr-quest-patcher-linux-x86_64
+          cp quest_openxr_layer/target/release/alvr-quest-patcher staging/alvr-quest-patcher-linux-x86_64/
+          cp quest_openxr_layer/target/release/alvr-xr-packager staging/alvr-quest-patcher-linux-x86_64/
+          cp quest_openxr_layer/README.md staging/alvr-quest-patcher-linux-x86_64/
+          mkdir -p release_out
+          tar -C staging -czf "release_out/${{ matrix.archive_name }}" alvr-quest-patcher-linux-x86_64
+
+      - name: Build & smoke-test Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path quest_openxr_layer/Cargo.toml -p quest_patcher_gui -p android_packager
+          $proc = Start-Process -FilePath ".\quest_openxr_layer\target\release\alvr-quest-patcher.exe" `
+            -ArgumentList "--self-test", "--self-test-report", "self_test.txt" -Wait -PassThru
+          if (Test-Path "self_test.txt") { Get-Content "self_test.txt" }
+          if ($proc.ExitCode -ne 0) { throw "alvr-quest-patcher.exe --self-test failed with exit code $($proc.ExitCode)" }
+          $stage = "staging\alvr-quest-patcher-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stage, "release_out" | Out-Null
+          Copy-Item "quest_openxr_layer\target\release\alvr-quest-patcher.exe" $stage
+          Copy-Item "quest_openxr_layer\target\release\alvr-xr-packager.exe" $stage
+          Copy-Item "quest_openxr_layer\README.md" $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "release_out\${{ matrix.archive_name }}" -Force
+
+      - name: Build & smoke-test macOS Universal (arm64 + x86_64) app bundle & CLI
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin --manifest-path quest_openxr_layer/Cargo.toml \
+            -p quest_patcher_gui -p android_packager
+          cargo build --release --target x86_64-apple-darwin --manifest-path quest_openxr_layer/Cargo.toml \
+            -p quest_patcher_gui -p android_packager
+
+          mkdir -p universal
+          lipo -create \
+            quest_openxr_layer/target/aarch64-apple-darwin/release/alvr-quest-patcher \
+            quest_openxr_layer/target/x86_64-apple-darwin/release/alvr-quest-patcher \
+            -output universal/alvr-quest-patcher
+          lipo -create \
+            quest_openxr_layer/target/aarch64-apple-darwin/release/alvr-xr-packager \
+            quest_openxr_layer/target/x86_64-apple-darwin/release/alvr-xr-packager \
+            -output universal/alvr-xr-packager
+          chmod +x universal/alvr-quest-patcher universal/alvr-xr-packager
+          lipo -info universal/alvr-quest-patcher
+
+          ./universal/alvr-quest-patcher --self-test --self-test-report self_test.txt
+          cat self_test.txt
+
+          APP_DIR="staging/ALVR Quest Patcher.app"
+          mkdir -p "${APP_DIR}/Contents/MacOS" release_out
+          cp universal/alvr-quest-patcher "${APP_DIR}/Contents/MacOS/alvr-quest-patcher"
+          cp universal/alvr-xr-packager staging/alvr-xr-packager
+          cp quest_openxr_layer/README.md staging/README.md
+          cat > "${APP_DIR}/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>ALVR Quest Patcher</string>
+            <key>CFBundleDisplayName</key>
+            <string>ALVR Quest Patcher</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.alvr.quest-openxr-patcher</string>
+            <key>CFBundleVersion</key>
+            <string>0.1.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleExecutable</key>
+            <string>alvr-quest-patcher</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "${APP_DIR}" || true
+          (cd staging && ditto -c -k --sequesterRsrc . "../release_out/${{ matrix.archive_name }}")
+
+      - name: Upload desktop archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: release_out/${{ matrix.archive_name }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-quest-layer, build-desktop-gui]
+    if: >-
+      startsWith(github.ref, 'refs/tags/quest-layer-v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Assemble release assets and SHA256SUMS
+        id: stage
+        run: |
+          mkdir -p release_assets
+          cp downloaded/desktop-windows-x86_64/alvr-quest-patcher-windows-x86_64.zip release_assets/
+          cp downloaded/desktop-macos-universal/alvr-quest-patcher-macos-universal.zip release_assets/
+          cp downloaded/desktop-linux-x86_64/alvr-quest-patcher-linux-x86_64.tar.gz release_assets/
+          cp downloaded/quest-layer-dist/arm64-v8a/libXrApiLayer_alvr_hand_emulation.so \
+             release_assets/libXrApiLayer_alvr_hand_emulation-arm64-v8a.so
+          cp downloaded/quest-layer-dist/XrApiLayer_alvr_hand_emulation.json release_assets/
+          cp downloaded/quest-layer-dist/alvr-hand-controller-layer.aar release_assets/
+          cp downloaded/quest-layer-dist/alvr_hand_controller.default.json release_assets/
+
+          (cd release_assets && sha256sum * > SHA256SUMS.txt)
+          cat release_assets/SHA256SUMS.txt
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          else
+            TAG="quest-layer-v0.1.0-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.stage.outputs.tag }}
+        run: |
+          cat > release_notes.md <<'NOTES'
+          ## ALVR Quest OpenXR Hand-to-Touch Layer & Self-Contained Desktop Patcher
+
+          Zero-install cross-platform desktop patcher + standalone Quest `arm64-v8a` OpenXR 1.0/1.1 implicit API layer (`XR_APILAYER_ALVR_hand_emulation`).
+
+          ### Included Downloads
+          - **Windows (`x86_64`)**: `alvr-quest-patcher-windows-x86_64.zip` — drag-and-drop GUI (`alvr-quest-patcher.exe`) + pure-Rust CLI (`alvr-xr-packager.exe`)
+          - **macOS (`Universal arm64 + x86_64`)**: `alvr-quest-patcher-macos-universal.zip` — `ALVR Quest Patcher.app` + universal CLI (`alvr-xr-packager`)
+          - **Linux (`x86_64`)**: `alvr-quest-patcher-linux-x86_64.tar.gz` — GUI (`alvr-quest-patcher`) + CLI (`alvr-xr-packager`)
+          - **Android / Unity / Unreal / Gradle Integration**: `alvr-hand-controller-layer.aar`, `libXrApiLayer_alvr_hand_emulation-arm64-v8a.so`, `XrApiLayer_alvr_hand_emulation.json`, and `alvr_hand_controller.default.json`
+          - **Checksums**: `SHA256SUMS.txt`
+
+          ### Highlights
+          - **Zero External Installs**: Embeds the prebuilt 16 KB ELF-aligned Quest `arm64-v8a` `.so`, layer manifest `.json`, streaming 16 KB APK aligner, and pure-Rust APK Signature Scheme v1/v2/v3 signer & verifier (no Java, `keytool`, `zipalign`, or `apksigner` required).
+          - **Cross-Verified in CI**: Tested against the Khronos OpenXR 1.1.54 loader and official Android SDK `aapt`, `zipalign -c -P 16 4`, and `apksigner verify --min-sdk-version 21`.
+          - **Scope**: Strictly for unprotected non-Meta-Store OpenXR APKs, sideloaded builds, or your own apps — zero DRM, entitlement, or anti-cheat bypasses.
+          NOTES
+
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "ALVR Quest OpenXR Hand Layer ${RELEASE_TAG}" \
+              --notes-file release_notes.md
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" release_assets/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" release_assets/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "ALVR Quest OpenXR Hand Layer ${RELEASE_TAG}" \
+              --notes-file release_notes.md
+          fi
