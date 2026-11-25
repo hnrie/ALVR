@@ -1341,11 +1341,22 @@ Because of runtime limitations, this option is ignored when body tracking is act
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
 #[schema(gui = "button_group")]
-pub enum SocketProtocol {
+pub enum SocketTransport {
     #[schema(strings(display_name = "UDP"))]
     Udp,
     #[schema(strings(display_name = "TCP"))]
     Tcp,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
+#[schema(collapsible)]
+pub struct PreferredStreamTransportsConfig {
+    pub video: SocketTransport,
+    pub game_audio: SocketTransport,
+    pub microphone: SocketTransport,
+    pub tracking: SocketTransport,
+    pub haptics: SocketTransport,
+    pub statistics: SocketTransport,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1387,7 +1398,7 @@ pub struct ConnectionConfig {
         help = r#"UDP: Faster, but less stable than TCP. Try this if your network is well optimized and free of interference.
 TCP: Slower than UDP, but more stable. Pick this if you experience video or audio stutters with UDP."#
     ))]
-    pub stream_protocol: SocketProtocol,
+    pub preferred_stream_transports: PreferredStreamTransportsConfig,
 
     pub client_discovery: Switch<DiscoveryConfig>,
 
@@ -1453,7 +1464,6 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
     #[schema(gui(slider(min = 1024, max = 65507, logarithmic)), suffix = "B")]
     pub packet_size: i32,
 
-    pub stream_port: u16,
     pub web_server_port: u16,
 
     #[schema(strings(display_name = "Local OSC port"))]
@@ -2174,8 +2184,26 @@ pub fn session_settings_default() -> SettingsDefault {
             max_prediction_ms: 100,
         },
         connection: ConnectionConfigDefault {
-            stream_protocol: SocketProtocolDefault {
-                variant: SocketProtocolDefaultVariant::Udp,
+            preferred_stream_transports: PreferredStreamTransportsConfigDefault {
+                gui_collapsed: true,
+                video: SocketTransportDefault {
+                    variant: SocketTransportDefaultVariant::Udp,
+                },
+                game_audio: SocketTransportDefault {
+                    variant: SocketTransportDefaultVariant::Udp,
+                },
+                microphone: SocketTransportDefault {
+                    variant: SocketTransportDefaultVariant::Udp,
+                },
+                tracking: SocketTransportDefault {
+                    variant: SocketTransportDefaultVariant::Udp,
+                },
+                haptics: SocketTransportDefault {
+                    variant: SocketTransportDefaultVariant::Udp,
+                },
+                statistics: SocketTransportDefault {
+                    variant: SocketTransportDefaultVariant::Udp,
+                },
             },
             client_discovery: SwitchDefault {
                 enabled: true,
@@ -2196,7 +2224,6 @@ pub fn session_settings_default() -> SettingsDefault {
                 content: WiredClientAutoLaunchConfigDefault { boot_delay: 0 },
             },
             web_server_port: 8082,
-            stream_port: 9944,
             osc_local_port: 9942,
             dscp: OptionalDefault {
                 set: false,
