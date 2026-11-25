@@ -2,7 +2,21 @@
 
 A standalone Android (`arm64-v8a`) OpenXR 1.0/1.1 Implicit API Layer (`XR_APILAYER_ALVR_hand_emulation`) that ports ALVR's hand-tracking gesture bindings (`alvr/server_core/src/hand_gestures.rs`) and hand-to-controller pose offsets (`alvr/session/src/settings.rs`, `alvr/server_openvr/src/tracking.rs`) directly onto Meta Quest OpenXR applications so you can play standalone Quest OpenXR apps using only optical hand tracking.
 
-> **Scope & Policy Notice:** This project strictly implements a standard Khronos OpenXR Implicit API Layer plus `.aar` and unprotected APK bundling tools. It contains **zero DRM, entitlement, or anti-cheat bypasses** and is intended exclusively for unprotected non-Meta-Store OpenXR APKs, sideloaded builds, or apps you build yourself.
+> **Scope & Policy Notice:** This project strictly implements a standard Khronos OpenXR Implicit API Layer plus `.aar` and unprotected APK bundling, 16 KB alignment, and v1/v2/v3 signing tools. It contains **zero DRM, entitlement, or anti-cheat bypasses** and is intended exclusively for unprotected non-Meta-Store OpenXR APKs, sideloaded builds, or apps you build yourself.
+
+---
+
+## Self-Contained Desktop Patcher GUI (Windows / macOS / Linux)
+
+The `alvr-quest-patcher` desktop app embeds everything in a **single binary with zero extra installs** (no Android SDK, Java, `keytool`, `zipalign`, or `apksigner` required):
+
+- Embedded prebuilt 16 KB-aligned Quest `arm64-v8a` `libXrApiLayer_alvr_hand_emulation.so`
+- Embedded OpenXR implicit layer manifest `XrApiLayer_alvr_hand_emulation.json` and default gesture/pose config
+- Pure-Rust binary `AndroidManifest.xml` (AXML) patcher & safe side-by-side package renamer (qualifies relative Java component class names)
+- Pure-Rust streaming 16 KB APK aligner (`zipalign -P 16 4` equivalent)
+- Pure-Rust APK Signature Scheme v1 + v2 + v3 signer & cryptographic verifier (supports persistent auto-generated debug keys, `.p12`/`.pfx`, `.jks`/`.keystore`, and `.pem`)
+
+Simply drag-and-drop an unprotected Quest OpenXR `.apk` into the window and click **Patch, 16 KB Align & Sign APK**.
 
 ---
 
@@ -58,11 +72,14 @@ Meta Quest OpenXR Runtime
 ```bash
 cd quest_openxr_layer
 
-# 1. One-time toolchain setup (Rust aarch64-linux-android, Android NDK r26b, zipalign/apksigner/aapt)
-./scripts/setup_android_env.sh
-
-# 2. Build host + Android arm64-v8a .so, alvr-xr-packager CLI, and dist/ artifacts (.so, .json, .aar)
+# 1. Build Quest arm64-v8a .so, pure-Rust alvr-xr-packager CLI, and dist/ artifacts (.so, .json, .aar)
 ./scripts/build_android.sh
+
+# 2. Build the self-contained desktop GUI (embeds dist/arm64-v8a/*.so, manifest, default config, aligner & signer)
+cargo build --release -p quest_patcher_gui
+
+# 3. Verify embedded binary + pure-Rust roundtrip headlessly
+./target/release/alvr-quest-patcher --self-test
 ```
 
 Distributable artifacts are written to `quest_openxr_layer/dist/`:
@@ -75,12 +92,10 @@ Distributable artifacts are written to `quest_openxr_layer/dist/`:
 
 ## Integrating into Quest OpenXR Apps
 
-### Option A — Drop-in Android `.aar` (Unity / Unreal / Godot / Gradle)
-Copy `dist/alvr-hand-controller-layer.aar` into your Android library folder (e.g. `Assets/Plugins/Android/` in Unity or `libs/` in Gradle). Android Manifest Merger automatically merges the Quest/AOSP hand-tracking permissions, `oculus.software.handtracking` (`required="false"`), hand-tracking `meta-data`, native library, and implicit layer manifest.
+### Option A — Self-Contained Desktop GUI (`alvr-quest-patcher`)
+Download the release archive for Windows, macOS, or Linux, launch `alvr-quest-patcher`, drop in your unprotected OpenXR `.apk`, and click **Patch, 16 KB Align & Sign APK**.
 
-### Option B — Bundling into an Unprotected Non-Meta-Store OpenXR APK
-Use the `alvr-xr-packager` CLI to inject the OpenXR implicit layer (uncompressed & 16 KB page-aligned), patch the binary `AndroidManifest.xml` idempotently, and sign with APK Signature Scheme v1+v2+v3:
-
+### Option B — Pure-Rust CLI (`alvr-xr-packager`, Zero External Tools)
 ```bash
 ./target/release/alvr-xr-packager patch-apk \
   --input  /path/to/unprotected_game.apk \
@@ -89,7 +104,7 @@ Use the `alvr-xr-packager` CLI to inject the OpenXR implicit layer (uncompressed
   --manifest ./dist/XrApiLayer_alvr_hand_emulation.json \
   --config ./dist/alvr_hand_controller.default.json
 
-# Verify the resulting APK (manifest entries, 16KB .so alignment, ELF, v2/v3 signature):
+# Verify the resulting APK (manifest entries, 16 KB alignment, ELF, v1/v2/v3 signatures):
 ./target/release/alvr-xr-packager inspect-apk \
   --input /path/to/unprotected_game_handtracking.apk
 
@@ -97,23 +112,32 @@ Use the `alvr-xr-packager` CLI to inject the OpenXR implicit layer (uncompressed
 adb install -r /path/to/unprotected_game_handtracking.apk
 ```
 
-*(Pass `--keystore <file.p12> --ks-pass <pass> --ks-alias <alias>` to sign with your own keystore; omit them to auto-generate a debug keystore via `keytool`.)*
+*(Pass `--keystore <file.p12|.jks|.pem> --ks-pass <pass> --ks-alias <alias>` to sign with your own keystore; omit them to automatically create and reuse a persistent local RSA-2048 debug keypair in your user config directory.)*
+
+### Option C — Drop-in Android `.aar` (Unity / Unreal / Godot / Gradle)
+Copy `dist/alvr-hand-controller-layer.aar` into your Android library folder (e.g. `Assets/Plugins/Android/` in Unity or `libs/` in Gradle). Android Manifest Merger automatically merges the Quest/AOSP hand-tracking permissions, `oculus.software.handtracking` (`required="false"`), hand-tracking `meta-data`, native library, and implicit layer manifest.
 
 ---
 
 ## Runtime Tuning & Diagnostics on Quest
 
-You can tune gesture distances, delays, joystick deadzone/offsets, or grip/aim pose offsets without rebuilding the APK by pushing a JSON file (starting from `dist/alvr_hand_controller.default.json`) to the app's external files directory:
+Configuration precedence on Quest:
+1. `ALVR_HAND_LAYER_CONFIG` environment variable (if set)
+2. `/sdcard/Android/data/<package.name>/files/alvr_hand_controller.json` (app external files dir)
+3. `/data/user/0/<package.name>/files/alvr_hand_controller.json` (app internal files dir)
+4. APK bundled `assets/alvr_hand_controller.json` (embedded by the patcher/GUI)
+5. Built-in ALVR defaults
+
+You can override gesture distances, delays, joystick deadzone/offsets, or grip/aim pose offsets without rebuilding the APK:
 
 ```bash
 adb push dist/alvr_hand_controller.default.json \
   /sdcard/Android/data/<package.name>/files/alvr_hand_controller.json
 ```
 
-On desktop/host tests you can also set `ALVR_HAND_LAYER_CONFIG=/path/to/config.json`.
 To disable the implicit layer at runtime, set `DISABLE_XR_APILAYER_ALVR_HAND_EMULATION=1`.
-
 Inspect layer logs on Quest via:
+
 ```bash
 adb logcat -s ALVRHandLayer:V OpenXR-Loader:V
 ```
@@ -124,8 +148,8 @@ adb logcat -s ALVRHandLayer:V OpenXR-Loader:V
 
 ```bash
 # Unit tests for alvr_hand_core, xr_api_layer, and android_packager
-cargo test --offline
+cargo test -p alvr_hand_core -p xr_api_layer -p android_packager
 
-# Full opaque-box 4-tier E2E suite (direct dlopen + real Khronos OpenXR 1.1.54 loader + real aapt/zipalign/apksigner)
-cd e2e_suite && ./run_e2e.sh --all
+# Full opaque-box 3-tier E2E suite (direct dlopen + real Khronos OpenXR 1.1.54 loader + official Android SDK aapt/zipalign/apksigner cross-verification)
+./e2e_suite/run_e2e.sh
 ```

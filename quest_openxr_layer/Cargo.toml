@@ -4,6 +4,7 @@ members = [
     "crates/alvr_hand_core",
     "crates/xr_api_layer",
     "crates/android_packager",
+    "crates/quest_patcher_gui",
 ]
 exclude = [
     "e2e_suite",
@@ -18,20 +19,31 @@ authors = ["ALVR contributors"]
 [workspace.dependencies]
 alvr_hand_core = { path = "crates/alvr_hand_core" }
 anyhow = "1.0.103"
+base64 = "0.22.1"
 crc32fast = "1.5.0"
 flate2 = "1.1.9"
 glam = "0.32.1"
 hex = "0.4.3"
+jks = { version = "0.3.3", default-features = false, features = ["rand"] }
 libc = "0.2.186"
 libloading = "0.9.0"
 log = "0.4.33"
 openxr-sys = { version = "0.13.1", default-features = false }
+p12-keystore = "0.4.1"
 parking_lot = "0.12.5"
 pico-args = "0.5.0"
 quick-xml = "0.39.2"
+rand = "0.8.5"
+rsa = { version = "0.9.10", features = ["sha1", "sha2", "pem"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 thiserror = "2.0.18"
 zip = { version = "8.5.1", default-features = false, features = ["deflate-flate2"] }
+
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

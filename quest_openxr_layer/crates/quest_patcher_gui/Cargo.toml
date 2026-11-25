@@ -1,0 +1,19 @@
+[package]
+name = "quest_patcher_gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Self-contained cross-platform desktop GUI for patching Quest OpenXR APKs with the ALVR hand-to-Touch API layer, 16 KB alignment, and v1/v2/v3 signing"
+
+[[bin]]
+name = "alvr-quest-patcher"
+path = "src/main.rs"
+
+[dependencies]
+alvr_hand_core = { workspace = true }
+android_packager = { path = "../android_packager" }
+anyhow = { workspace = true }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = "0.15.4"
+serde_json = { workspace = true }

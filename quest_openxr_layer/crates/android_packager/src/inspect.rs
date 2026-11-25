@@ -1,12 +1,13 @@
 //! Pure-Rust ELF64 binary analyzer plus `.aar` and `.apk` archive inspector.
 
+use crate::align::{verify_apk_alignment, AlignmentReport};
 use crate::axml::{inspect_axml, ManifestInspection};
+use crate::sign::{verify_apk_signatures, ApkSignatureVerification};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::Path;
-use std::process::Command;
 
 pub const EM_AARCH64: u16 = 183;
 pub const EM_X86_64: u16 = 62;
@@ -63,8 +64,12 @@ pub struct ArchiveInspection {
     pub layer_so_elf: Option<ElfInspection>,
     pub has_openxr_loader: bool,
     pub has_legacy_vrapi: bool,
+    pub has_arm64_abi: bool,
+    pub has_any_native_libs: bool,
+    pub alignment: Option<AlignmentReport>,
     pub signature_verified: Option<bool>,
     pub signature_detail: Option<String>,
+    pub signature_verification: Option<ApkSignatureVerification>,
 }
 
 fn r_u16(b: &[u8], o: usize) -> Result<u16> {
@@ -416,19 +421,28 @@ pub fn inspect_archive(path: &Path) -> Result<ArchiveInspection> {
             Err(_) => (false, false, None),
         };
 
-    // Scan entries for OpenXR loader, VrApi, and our layer .so
+    // Scan entries for OpenXR loader, VrApi, ABIs, and our layer .so
     let mut has_openxr_loader = false;
     let mut has_legacy_vrapi = false;
+    let mut has_arm64_abi = false;
+    let mut has_any_native_libs = false;
     let mut found_so_path = None;
 
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name();
-        if name.contains("openxr") && name.ends_with(".so") && !name.contains("XrApiLayer") {
-            has_openxr_loader = true;
-        }
-        if name.ends_with("libvrapi.so") {
-            has_legacy_vrapi = true;
+        let lower = name.to_ascii_lowercase();
+        if (name.starts_with("lib/") || name.starts_with("jni/")) && lower.ends_with(".so") {
+            has_any_native_libs = true;
+            if name.starts_with("lib/arm64-v8a/") || name.starts_with("jni/arm64-v8a/") {
+                has_arm64_abi = true;
+            }
+            if lower.contains("openxr") && !lower.contains("xrapilayer") {
+                has_openxr_loader = true;
+            }
+            if lower.ends_with("libvrapi.so") {
+                has_legacy_vrapi = true;
+            }
         }
         if name == EXPECTED_APK_SO_PATH || name == EXPECTED_AAR_SO_PATH {
             found_so_path = Some(name.to_owned());
@@ -453,25 +467,31 @@ pub fn inspect_archive(path: &Path) -> Result<ArchiveInspection> {
         layer_so_elf = inspect_elf(&so_bytes).ok();
     }
 
-    // For APKs, run `apksigner verify` if available on PATH.
-    let (signature_verified, signature_detail) = if !is_aar {
-        match Command::new("apksigner")
-            .args(["verify", "--verbose"])
-            .arg(path)
-            .output()
-        {
-            Ok(out) => {
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
+    drop(zip);
+
+    // For APKs, run pure-Rust 16 KB alignment check and v1/v2/v3 cryptographic signature verification.
+    let (alignment, signature_verified, signature_detail, signature_verification) = if !is_aar {
+        let align_rep = verify_apk_alignment(path).ok();
+        match verify_apk_signatures(path) {
+            Ok(ver) => {
+                let detail = format!(
+                    "v1={}, v2={}, v3={}, cert_sha256={}{}",
+                    ver.v1_verified,
+                    ver.v2_verified,
+                    ver.v3_verified,
+                    ver.cert_sha256.as_deref().unwrap_or("none"),
+                    if ver.errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; errors: {}", ver.errors.join("; "))
+                    }
                 );
-                (Some(out.status.success()), Some(text.trim().to_owned()))
+                (align_rep, Some(ver.valid), Some(detail), Some(ver))
             }
-            Err(_) => (None, Some("apksigner not found on PATH".to_owned())),
+            Err(err) => (align_rep, Some(false), Some(format!("{err:#}")), None),
         }
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     let has_quest_hand_tracking = manifest.has_quest_hand_tracking();
@@ -491,8 +511,12 @@ pub fn inspect_archive(path: &Path) -> Result<ArchiveInspection> {
         layer_so_elf,
         has_openxr_loader,
         has_legacy_vrapi,
+        has_arm64_abi,
+        has_any_native_libs,
+        alignment,
         signature_verified,
         signature_detail,
+        signature_verification,
     })
 }
 
