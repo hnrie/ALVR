@@ -1180,3 +1180,301 @@ fn t1_khr_simple_controller_and_shared_action_physical_precedence() {
     app.destroy();
 }
 
+#[test]
+fn t1_action_set_priority_and_unsynced_action_space_invalidation() {
+    let _g = HARNESS_LOCK.lock();
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h = DirectLayerHarness::load().unwrap();
+    let app = XrApp::new(h, xr::Version::new(1, 0, 0), &["XR_MND_headless"]);
+
+    unsafe {
+        let create_as: xr::pfn::CreateActionSet = app.h.pfn(app.inst, "xrCreateActionSet").unwrap();
+        let create_act: xr::pfn::CreateAction = app.h.pfn(app.inst, "xrCreateAction").unwrap();
+        let attach: xr::pfn::AttachSessionActionSets =
+            app.h.pfn(app.inst, "xrAttachSessionActionSets").unwrap();
+        let begin: xr::pfn::BeginSession = app.h.pfn(app.inst, "xrBeginSession").unwrap();
+        let sync: xr::pfn::SyncActions = app.h.pfn(app.inst, "xrSyncActions").unwrap();
+        let loc_fn: xr::pfn::LocateSpace = app.h.pfn(app.inst, "xrLocateSpace").unwrap();
+        let destroy_sp: xr::pfn::DestroySpace = app.h.pfn(app.inst, "xrDestroySpace").unwrap();
+        let destroy_as: xr::pfn::DestroyActionSet =
+            app.h.pfn(app.inst, "xrDestroyActionSet").unwrap();
+
+        // Create higher-priority menu_set (priority = 10 > app.action_set priority = 0)
+        let mut asci = xr::ActionSetCreateInfo {
+            ty: xr::StructureType::ACTION_SET_CREATE_INFO,
+            next: std::ptr::null(),
+            action_set_name: [0; xr::MAX_ACTION_SET_NAME_SIZE],
+            localized_action_set_name: [0; xr::MAX_LOCALIZED_ACTION_SET_NAME_SIZE],
+            priority: 10,
+        };
+        for (i, b) in b"menu_set".iter().enumerate() {
+            asci.action_set_name[i] = *b as c_char;
+            asci.localized_action_set_name[i] = *b as c_char;
+        }
+        let mut menu_set = xr::ActionSet::NULL;
+        assert_eq!(create_as(app.inst, &asci, &mut menu_set), xr::Result::SUCCESS);
+
+        let game_trig = app.create_action("game_trig", xr::ActionType::FLOAT_INPUT, &[app.left_user]);
+
+        let make_menu_act = |name: &str, ty: xr::ActionType| -> xr::Action {
+            let mut aci = xr::ActionCreateInfo {
+                ty: xr::StructureType::ACTION_CREATE_INFO,
+                next: std::ptr::null(),
+                action_name: [0; xr::MAX_ACTION_NAME_SIZE],
+                action_type: ty,
+                count_subaction_paths: 1,
+                subaction_paths: &app.left_user,
+                localized_action_name: [0; xr::MAX_LOCALIZED_ACTION_NAME_SIZE],
+            };
+            for (i, b) in name.as_bytes().iter().enumerate() {
+                aci.action_name[i] = *b as c_char;
+                aci.localized_action_name[i] = *b as c_char;
+            }
+            let mut act = xr::Action::NULL;
+            assert_eq!(create_act(menu_set, &aci, &mut act), xr::Result::SUCCESS);
+            act
+        };
+        let menu_trig = make_menu_act("menu_trig", xr::ActionType::FLOAT_INPUT);
+        let menu_grip = make_menu_act("menu_grip", xr::ActionType::POSE_INPUT);
+
+        app.suggest(
+            "/interaction_profiles/oculus/touch_controller",
+            &[
+                (game_trig, "/user/hand/left/input/trigger/value"),
+                (menu_trig, "/user/hand/left/input/trigger/value"),
+                (menu_grip, "/user/hand/left/input/grip/pose"),
+            ],
+        );
+
+        let sets = [app.action_set, menu_set];
+        let asai = xr::SessionActionSetsAttachInfo {
+            ty: xr::StructureType::SESSION_ACTION_SETS_ATTACH_INFO,
+            next: std::ptr::null(),
+            count_action_sets: 2,
+            action_sets: sets.as_ptr(),
+        };
+        assert_eq!(attach(app.sess, &asai), xr::Result::SUCCESS);
+        let sbi = xr::SessionBeginInfo {
+            ty: xr::StructureType::SESSION_BEGIN_INFO,
+            next: std::ptr::null(),
+            primary_view_configuration_type: xr::ViewConfigurationType::PRIMARY_STEREO,
+        };
+        assert_eq!(begin(app.sess, &sbi), xr::Result::SUCCESS);
+
+        let menu_grip_sp = app.create_action_space(menu_grip, app.left_user, xr::Posef::IDENTITY);
+
+        global_engine().set_hand_state(
+            0,
+            HandSkeletonBuilder::open(0, Vec3::new(-0.2, 1.2, -0.4), Quat::IDENTITY)
+                .with_pinch(10, 0.0)
+                .build(),
+        );
+
+        // 1. Sync ONLY low-priority game set -> game_trig fires, unsynced menu_grip_sp is NOT valid/tracked!
+        assert_eq!(app.sync(), xr::Result::SUCCESS);
+        advance_dual_clock_ms(65);
+        assert_eq!(app.sync(), xr::Result::SUCCESS);
+        assert_eq!(app.get_float(game_trig, app.left_user).is_active, xr::TRUE);
+        assert!((app.get_float(game_trig, app.left_user).current_state - 1.0).abs() < 1e-3);
+
+        let t = xr::Time::from_nanos(global_engine().advance_time_ns(11_000_000));
+        let mut loc = xr::SpaceLocation {
+            ty: xr::StructureType::SPACE_LOCATION,
+            next: std::ptr::null_mut(),
+            location_flags: xr::SpaceLocationFlags::EMPTY,
+            pose: xr::Posef::IDENTITY,
+        };
+        assert_eq!(loc_fn(menu_grip_sp, app.local_space, t, &mut loc), xr::Result::SUCCESS);
+        assert_eq!(
+            loc.location_flags,
+            xr::SpaceLocationFlags::EMPTY,
+            "unsynced menu_set action space must not report valid/tracked pose"
+        );
+
+        // 2. Sync BOTH game set (prio 0) and menu set (prio 10) -> menu_set overrides shared trigger source!
+        let active_both = [
+            xr::ActiveActionSet {
+                action_set: app.action_set,
+                subaction_path: xr::Path::NULL,
+            },
+            xr::ActiveActionSet {
+                action_set: menu_set,
+                subaction_path: xr::Path::NULL,
+            },
+        ];
+        let si = xr::ActionsSyncInfo {
+            ty: xr::StructureType::ACTIONS_SYNC_INFO,
+            next: std::ptr::null(),
+            count_active_action_sets: 2,
+            active_action_sets: active_both.as_ptr(),
+        };
+        assert_eq!(sync(app.sess, &si), xr::Result::SUCCESS);
+        assert_eq!(app.get_float(menu_trig, app.left_user).is_active, xr::TRUE);
+        assert!((app.get_float(menu_trig, app.left_user).current_state - 1.0).abs() < 1e-3);
+        assert_eq!(
+            app.get_float(game_trig, app.left_user).is_active,
+            xr::FALSE,
+            "lower-priority gameplay trigger must be suppressed by higher-priority menu trigger"
+        );
+
+        // Now menu_grip_sp IS synced and must locate cleanly!
+        assert_eq!(loc_fn(menu_grip_sp, app.local_space, t, &mut loc), xr::Result::SUCCESS);
+        assert!(loc.location_flags.contains(
+            xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID
+        ));
+
+        assert_eq!(destroy_sp(menu_grip_sp), xr::Result::SUCCESS);
+        assert_eq!(destroy_as(menu_set), xr::Result::SUCCESS);
+    }
+
+    app.destroy();
+}
+
+#[test]
+fn t1_occluded_joints_never_false_fire_and_dormant_profile_falls_back_to_emulation() {
+    let _g = HARNESS_LOCK.lock();
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h = DirectLayerHarness::load().unwrap();
+    let app = XrApp::new(h, xr::Version::new(1, 0, 0), &["XR_MND_headless"]);
+
+    // Shared action bound to both hands without subaction paths
+    let trig = app.create_action("trig", xr::ActionType::FLOAT_INPUT, &[]);
+    let grip = app.create_action("grip", xr::ActionType::FLOAT_INPUT, &[]);
+    app.suggest(
+        "/interaction_profiles/oculus/touch_controller",
+        &[
+            (trig, "/user/hand/left/input/trigger/value"),
+            (trig, "/user/hand/right/input/trigger/value"),
+            (grip, "/user/hand/left/input/squeeze/value"),
+        ],
+    );
+    app.attach_and_begin();
+
+    // 1. Hand active, but all 26 joints occluded (POSITION_VALID = 0, zeroed coordinates):
+    // must NOT false-trigger index pinch or grip curl!
+    let mut occluded = MockHandState::default();
+    occluded.is_active = true;
+    for j in &mut occluded.joints {
+        j.location_flags = 0;
+        j.pose = MockPose::default();
+    }
+    global_engine().set_hand_state(0, occluded);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    advance_dual_clock_ms(120);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    assert_eq!(app.get_float(trig, xr::Path::NULL).current_state, 0.0);
+    assert_eq!(app.get_float(grip, xr::Path::NULL).current_state, 0.0);
+
+    // 2. Runtime retains a dormant Touch profile while physical controller is INACTIVE (sleeping):
+    // optical hand tracking must still take over cleanly!
+    global_engine().set_physical_controller(
+        0,
+        MockPhysicalControllerState {
+            active: false,
+            interaction_profile: Some("/interaction_profiles/oculus/touch_controller".to_owned()),
+            ..Default::default()
+        },
+    );
+    global_engine().set_hand_state(
+        0,
+        HandSkeletonBuilder::open(0, Vec3::ZERO, Quat::IDENTITY)
+            .with_pinch(10, 0.0)
+            .build(),
+    );
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    advance_dual_clock_ms(65);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    assert_eq!(app.get_float(trig, xr::Path::NULL).is_active, xr::TRUE);
+    assert!((app.get_float(trig, xr::Path::NULL).current_state - 1.0).abs() < 1e-3);
+
+    app.destroy();
+}
+
+#[test]
+fn t1_openxr_1_0_gates_locate_spaces_and_unfocused_haptics_and_end_session_event_pruning() {
+    let _g = HARNESS_LOCK.lock();
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h = DirectLayerHarness::load().unwrap();
+    // OpenXR 1.0 WITHOUT XR_KHR_locate_spaces!
+    let app = XrApp::new(h, xr::Version::new(1, 0, 0), &["XR_MND_headless"]);
+
+    let trig = app.create_action("trig", xr::ActionType::FLOAT_INPUT, &[app.left_user]);
+    let haptic = app.create_action("haptic", xr::ActionType::VIBRATION_OUTPUT, &[app.left_user]);
+    app.suggest(
+        "/interaction_profiles/oculus/touch_controller",
+        &[
+            (trig, "/user/hand/left/input/trigger/value"),
+            (haptic, "/user/hand/left/output/haptic"),
+        ],
+    );
+    app.attach_and_begin();
+
+    unsafe {
+        // 1. OpenXR 1.0 without XR_KHR_locate_spaces MUST NOT expose xrLocateSpaces or xrLocateSpacesKHR!
+        assert!(app.h.pfn::<xr::pfn::LocateSpaces>(app.inst, "xrLocateSpaces").is_err());
+        assert!(app
+            .h
+            .pfn::<xr::pfn::LocateSpacesKHR>(app.inst, "xrLocateSpacesKHR")
+            .is_err());
+
+        // 2. Activate left hand emulation (queues synthetic EVENT_DATA_INTERACTION_PROFILE_CHANGED)
+        global_engine().set_hand_state(
+            0,
+            HandSkeletonBuilder::open(0, Vec3::ZERO, Quat::IDENTITY).build(),
+        );
+        assert_eq!(app.sync(), xr::Result::SUCCESS);
+
+        // 3. Lose focus -> xrSyncActions observes SESSION_NOT_FOCUSED before xrPollEvent runs:
+        // xrApplyHapticFeedback on emulated hand MUST return SESSION_NOT_FOCUSED!
+        global_engine().set_session_state(xr::SessionState::VISIBLE);
+        assert_eq!(app.sync(), xr::Result::SESSION_NOT_FOCUSED);
+
+        let apply_h: xr::pfn::ApplyHapticFeedback =
+            app.h.pfn(app.inst, "xrApplyHapticFeedback").unwrap();
+        let hi = xr::HapticActionInfo {
+            ty: xr::StructureType::HAPTIC_ACTION_INFO,
+            next: std::ptr::null(),
+            action: haptic,
+            subaction_path: app.left_user,
+        };
+        let vib = xr::HapticVibration {
+            ty: xr::StructureType::HAPTIC_VIBRATION,
+            next: std::ptr::null(),
+            duration: xr::Duration::from_nanos(10_000_000),
+            frequency: 160.0,
+            amplitude: 0.5,
+        };
+        assert_eq!(
+            apply_h(app.sess, &hi, &vib as *const _ as *const xr::HapticBaseHeader),
+            xr::Result::SESSION_NOT_FOCUSED
+        );
+
+        // 4. End session BEFORE draining xrPollEvent -> queued synthetic interaction-profile event
+        // for this session MUST be pruned!
+        let end_sess: xr::pfn::EndSession = app.h.pfn(app.inst, "xrEndSession").unwrap();
+        assert_eq!(end_sess(app.sess), xr::Result::SUCCESS);
+
+        let poll: xr::pfn::PollEvent = app.h.pfn(app.inst, "xrPollEvent").unwrap();
+        loop {
+            let mut ev = xr::EventDataBuffer {
+                ty: xr::StructureType::EVENT_DATA_BUFFER,
+                next: std::ptr::null(),
+                varying: [0; 4000],
+            };
+            let res = poll(app.inst, &mut ev);
+            if res == xr::Result::EVENT_UNAVAILABLE {
+                break;
+            }
+            assert_eq!(res, xr::Result::SUCCESS);
+            assert_ne!(
+                ev.ty,
+                xr::StructureType::EVENT_DATA_INTERACTION_PROFILE_CHANGED,
+                "stale synthetic profile-changed event leaked past xrEndSession"
+            );
+        }
+    }
+
+    app.destroy();
+}
+
+

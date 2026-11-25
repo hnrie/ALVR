@@ -26,7 +26,12 @@ const ANDROID_NS_URI: &str = "http://schemas.android.com/apk/res/android";
 
 // Canonical Android framework attribute resource IDs (`android.R.attr.*`)
 pub const ATTR_RES_NAME: u32 = 0x0101_0003;
+pub const ATTR_RES_PERMISSION: u32 = 0x0101_0006;
+pub const ATTR_RES_READ_PERMISSION: u32 = 0x0101_0007;
+pub const ATTR_RES_WRITE_PERMISSION: u32 = 0x0101_0008;
+pub const ATTR_RES_AUTHORITIES: u32 = 0x0101_0018;
 pub const ATTR_RES_VALUE: u32 = 0x0101_0024;
+pub const ATTR_RES_TARGET_ACTIVITY: u32 = 0x0101_0202;
 pub const ATTR_RES_REQUIRED: u32 = 0x0101_028e;
 pub const ATTR_RES_EXTRACT_NATIVE_LIBS: u32 = 0x0101_04ea;
 
@@ -614,6 +619,9 @@ impl ParsedAxml {
         let insert_pos = self.resource_map.len();
         self.resource_map.push(res_id);
         self.string_pool.strings.insert(insert_pos, name.to_owned());
+        if insert_pos < self.string_pool.styles.len() {
+            self.string_pool.styles.insert(insert_pos, Vec::new());
+        }
 
         // Remap style spans (if any) and all XML event chunks for indices >= insert_pos.
         let threshold = insert_pos as u32;
@@ -699,24 +707,92 @@ fn build_end_element_chunk(name_idx: u32) -> RawChunk {
     }
 }
 
+/// Validates an Android application package identifier (e.g. `com.example.app`).
+pub fn is_valid_android_package_name(pkg: &str) -> bool {
+    let mut count = 0usize;
+    for seg in pkg.split('.') {
+        count += 1;
+        let mut chars = seg.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !first.is_ascii_alphabetic() {
+            return false;
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+    }
+    count >= 2
+}
+
+/// Qualifies an Android component class name against `oldpkg` if it is relative (starts with `.`
+/// or contains no `.`), leaving already-qualified class names untouched.
+fn qualify_component_class(val: &str, oldpkg: &str) -> Option<String> {
+    if val.is_empty() {
+        return None;
+    }
+    if val.starts_with('.') {
+        Some(format!("{oldpkg}{val}"))
+    } else if !val.contains('.') {
+        Some(format!("{oldpkg}.{val}"))
+    } else {
+        None
+    }
+}
+
+/// Rewrites semicolon-separated provider `android:authorities` entries matching `oldpkg` or `oldpkg.*`.
+fn rewrite_authorities(val: &str, oldpkg: &str, newpkg: &str) -> Option<String> {
+    let dotted = format!("{oldpkg}.");
+    let mut changed = false;
+    let rewritten: Vec<String> = val
+        .split(';')
+        .map(|part| {
+            let trimmed = part.trim();
+            if trimmed == oldpkg {
+                changed = true;
+                newpkg.to_owned()
+            } else if let Some(suffix) = trimmed.strip_prefix(&dotted) {
+                changed = true;
+                format!("{newpkg}.{suffix}")
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect();
+    if changed {
+        Some(rewritten.join(";"))
+    } else {
+        None
+    }
+}
+
 /// Inspects a binary `AndroidManifest.xml` (AXML) and extracts package, permissions, features,
-/// meta-data, and `extractNativeLibs`.
+/// application-level meta-data, and `extractNativeLibs`.
 pub fn inspect_axml(bytes: &[u8]) -> Result<ManifestInspection, AxmlError> {
     let axml = parse_axml(bytes)?;
     let mut out = ManifestInspection::default();
+    let mut tag_stack: Vec<String> = Vec::new();
 
     for chunk in &axml.chunks {
+        let hs = chunk.header_size as usize;
+        if chunk.chunk_type == RES_XML_END_ELEMENT_TYPE {
+            tag_stack.pop();
+            continue;
+        }
         if chunk.chunk_type != RES_XML_START_ELEMENT_TYPE {
             continue;
         }
-        let hs = chunk.header_size as usize;
         if chunk.data.len() < hs + 20 {
+            tag_stack.push(String::new());
             continue;
         }
         let name_idx = read_u32(&chunk.data, hs + 4)?;
         let Some(tag) = axml.get_str(name_idx) else {
+            tag_stack.push(String::new());
             continue;
         };
+        let parent_tag = tag_stack.last().map(String::as_str);
 
         let attr_start = read_u16(&chunk.data, hs + 8)? as usize;
         let attr_size = read_u16(&chunk.data, hs + 10)? as usize;
@@ -748,59 +824,77 @@ pub fn inspect_axml(bytes: &[u8]) -> Result<ManifestInspection, AxmlError> {
             };
 
             match tag {
-                "manifest" if a_name == "package" => {
+                "manifest" if parent_tag.is_none() && a_name == "package" => {
                     out.package = str_val();
                 }
                 "application"
-                    if res_id == Some(ATTR_RES_EXTRACT_NATIVE_LIBS)
-                        || a_name == "extractNativeLibs" =>
+                    if parent_tag == Some("manifest")
+                        && (res_id == Some(ATTR_RES_EXTRACT_NATIVE_LIBS)
+                            || a_name == "extractNativeLibs") =>
                 {
                     if val_type == ATTR_TYPE_INT_BOOLEAN {
                         out.extract_native_libs = Some(val_data != 0);
                     }
                 }
-                "uses-permission" | "uses-feature" | "meta-data" => {
+                "uses-permission" | "uses-feature" if parent_tag == Some("manifest") => {
                     if res_id == Some(ATTR_RES_NAME) || a_name == "name" {
                         attr_name_val = str_val();
-                    } else if res_id == Some(ATTR_RES_VALUE) || a_name == "value" {
-                        attr_value_val = str_val();
                     } else if res_id == Some(ATTR_RES_REQUIRED) || a_name == "required" {
                         if val_type == ATTR_TYPE_INT_BOOLEAN {
                             attr_required_val = Some(val_data != 0);
                         }
                     }
                 }
+                "meta-data" if parent_tag == Some("application") => {
+                    if res_id == Some(ATTR_RES_NAME) || a_name == "name" {
+                        attr_name_val = str_val();
+                    } else if res_id == Some(ATTR_RES_VALUE) || a_name == "value" {
+                        attr_value_val = str_val();
+                    }
+                }
                 _ => {}
             }
         }
 
-        match tag {
-            "uses-permission" => {
+        match (tag, parent_tag) {
+            ("uses-permission", Some("manifest")) => {
                 if let Some(n) = attr_name_val {
                     out.uses_permissions.push(n);
                 }
             }
-            "uses-feature" => {
+            ("uses-feature", Some("manifest")) => {
                 if let Some(n) = attr_name_val {
                     out.uses_features.push((n, attr_required_val));
                 }
             }
-            "meta-data" => {
+            ("meta-data", Some("application")) => {
                 if let Some(n) = attr_name_val {
                     out.meta_data.push((n, attr_value_val));
                 }
             }
             _ => {}
         }
+
+        tag_stack.push(tag.to_owned());
     }
 
     Ok(out)
 }
 
+/// Renames the manifest package for side-by-side installation while qualifying relative Java
+/// component class names against the original package so DEX class resolution stays intact.
 pub fn rename_package_axml(bytes: &[u8], newpkg: &str) -> Result<Vec<u8>, AxmlError> {
+    if !is_valid_android_package_name(newpkg) {
+        return Err(AxmlError::Invalid(format!(
+            "invalid Android package name '{newpkg}' (expected at least two dot-separated Java identifiers)"
+        )));
+    }
     let oldpkg = inspect_axml(bytes)?
         .package
         .ok_or_else(|| AxmlError::Invalid("manifest has no package".into()))?;
+    if oldpkg == newpkg {
+        return Ok(bytes.to_vec());
+    }
     let dotted = format!("{oldpkg}.");
     let mut axml = parse_axml(bytes)?;
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
@@ -818,7 +912,9 @@ pub fn rename_package_axml(bytes: &[u8], newpkg: &str) -> Result<Vec<u8>, AxmlEr
             if off + 20 > chunk.data.len() {
                 break;
             }
-            let aname = axml.get_str(read_u32(&chunk.data, off + 4)?).unwrap_or("");
+            let a_name_idx = read_u32(&chunk.data, off + 4)?;
+            let aname = axml.get_str(a_name_idx).unwrap_or("");
+            let res_id = axml.resource_map.get(a_name_idx as usize).copied();
             let idx = if chunk.data[off + 15] == ATTR_TYPE_STRING {
                 read_u32(&chunk.data, off + 16)?
             } else {
@@ -827,24 +923,45 @@ pub fn rename_package_axml(bytes: &[u8], newpkg: &str) -> Result<Vec<u8>, AxmlEr
             let Some(val) = axml.get_str(idx) else {
                 continue;
             };
-            let hit = match aname {
-                "package" => tag == "manifest" && val == oldpkg,
-                "authorities" => val.contains(&oldpkg),
-                "permission" | "readPermission" | "writePermission" => val.starts_with(&dotted),
-                "name" => {
-                    matches!(
-                        tag,
-                        "permission"
-                            | "permission-tree"
-                            | "permission-group"
-                            | "uses-permission"
-                            | "uses-permission-sdk-23"
-                    ) && val.starts_with(&dotted)
+
+            let replacement = if tag == "manifest" && aname == "package" && val == oldpkg {
+                Some(newpkg.to_owned())
+            } else if res_id == Some(ATTR_RES_AUTHORITIES) || aname == "authorities" {
+                rewrite_authorities(val, &oldpkg, newpkg)
+            } else if matches!(
+                res_id,
+                Some(ATTR_RES_PERMISSION | ATTR_RES_READ_PERMISSION | ATTR_RES_WRITE_PERMISSION)
+            ) || matches!(aname, "permission" | "readPermission" | "writePermission")
+            {
+                val.strip_prefix(&dotted)
+                    .map(|suffix| format!("{newpkg}.{suffix}"))
+            } else if (res_id == Some(ATTR_RES_TARGET_ACTIVITY) || aname == "targetActivity")
+                && tag == "activity-alias"
+            {
+                qualify_component_class(val, &oldpkg)
+            } else if res_id == Some(ATTR_RES_NAME) || aname == "name" {
+                match tag {
+                    "permission"
+                    | "permission-tree"
+                    | "permission-group"
+                    | "uses-permission"
+                    | "uses-permission-sdk-23" => val
+                        .strip_prefix(&dotted)
+                        .map(|suffix| format!("{newpkg}.{suffix}")),
+                    "application"
+                    | "activity"
+                    | "activity-alias"
+                    | "service"
+                    | "receiver"
+                    | "provider" => qualify_component_class(val, &oldpkg),
+                    _ => None,
                 }
-                _ => false,
+            } else {
+                None
             };
-            if hit {
-                edits.push((ci, off, val.replace(&oldpkg, newpkg)));
+
+            if let Some(new_val) = replacement {
+                edits.push((ci, off, new_val));
             }
         }
     }
@@ -1199,5 +1316,228 @@ mod tests {
         assert!(inspect_axml(b"not axml").is_err());
         assert!(patch_quest_hand_tracking_axml(&[0x03, 0x00, 0x08, 0x00, 0xFF, 0x00, 0x00, 0x00]).is_err());
     }
+
+    #[test]
+    fn nested_activity_metadata_does_not_suppress_application_metadata_and_styles_stay_aligned() {
+        let mut raw_axml = parse_axml(&synth_minimal_axml(true)).unwrap();
+        // Attach a styled string span referencing string index 5 ("com.test.utf16") at style slot 5.
+        raw_axml.string_pool.styles = vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![StyleSpan {
+                name: 3, // "manifest"
+                first_char: 0,
+                last_char: 2,
+            }],
+        ];
+        // Insert an <activity android:name=".MainActivity"><meta-data android:name="com.oculus.handtracking.frequency" android:value="LOW"/></activity>
+        let act_tag = raw_axml.intern_plain_string("activity");
+        let meta_tag = raw_axml.intern_plain_string("meta-data");
+        let rel_act = raw_axml.intern_plain_string(".MainActivity");
+        let freq_k = raw_axml.intern_plain_string(META_HAND_FREQ);
+        let freq_v = raw_axml.intern_plain_string("LOW");
+        let android_ns = raw_axml.intern_plain_string(ANDROID_NS_URI);
+        let attr_name = 0u32; // ATTR_RES_NAME
+        let attr_value = raw_axml.intern_resource_attr("value", ATTR_RES_VALUE).unwrap();
+
+        // After inserting 1 resource attr at index 1, style slot 5 shifted to slot 6 and span.name shifted 3->4.
+        assert_eq!(raw_axml.string_pool.styles.len(), 7);
+        assert_eq!(raw_axml.string_pool.styles[6].len(), 1);
+        assert_eq!(
+            raw_axml.get_str(raw_axml.string_pool.styles[6][0].name),
+            Some("manifest")
+        );
+
+        let act_start = build_start_element_chunk(
+            act_tag,
+            vec![ElementAttr {
+                ns: android_ns,
+                name: attr_name,
+                res_id: ATTR_RES_NAME,
+                raw_value: rel_act,
+                data_type: ATTR_TYPE_STRING,
+                data: rel_act,
+            }],
+        );
+        let nested_meta_start = build_start_element_chunk(
+            meta_tag,
+            vec![
+                ElementAttr {
+                    ns: android_ns,
+                    name: attr_name,
+                    res_id: ATTR_RES_NAME,
+                    raw_value: freq_k,
+                    data_type: ATTR_TYPE_STRING,
+                    data: freq_k,
+                },
+                ElementAttr {
+                    ns: android_ns,
+                    name: attr_value,
+                    res_id: ATTR_RES_VALUE,
+                    raw_value: freq_v,
+                    data_type: ATTR_TYPE_STRING,
+                    data: freq_v,
+                },
+            ],
+        );
+        let nested_meta_end = build_end_element_chunk(meta_tag);
+        let act_end = build_end_element_chunk(act_tag);
+        // Insert inside <application> (before app_end at index 3).
+        raw_axml
+            .chunks
+            .splice(3..3, [act_start, nested_meta_start, nested_meta_end, act_end]);
+        let bytes = serialize_axml(&raw_axml);
+
+        // inspect_axml must ignore activity-scoped <meta-data>
+        let before = inspect_axml(&bytes).unwrap();
+        assert!(before.meta_data.is_empty());
+
+        let (patched, report) = patch_quest_hand_tracking_axml(&bytes).unwrap();
+        assert!(report.added_meta_data.contains(&META_HAND_FREQ.to_owned()));
+        assert!(inspect_axml(&patched).unwrap().has_quest_hand_tracking());
+
+        // Styles must still parse cleanly after adding ATTR_RES_REQUIRED during patch.
+        let reparsed = parse_axml(&patched).unwrap();
+        assert_eq!(reparsed.string_pool.styles.len(), 8);
+        assert_eq!(
+            reparsed.get_str(reparsed.string_pool.styles[7][0].name),
+            Some("manifest")
+        );
+    }
+
+    #[test]
+    fn rename_package_validates_qualifies_relative_components_and_rewrites_authorities() {
+        let mut axml = parse_axml(&synth_minimal_axml(true)).unwrap();
+        let android_ns = axml.intern_plain_string(ANDROID_NS_URI);
+        let attr_name = 0u32;
+        let attr_auth = axml
+            .intern_resource_attr("authorities", ATTR_RES_AUTHORITIES)
+            .unwrap();
+        let attr_target = axml
+            .intern_resource_attr("targetActivity", ATTR_RES_TARGET_ACTIVITY)
+            .unwrap();
+
+        let act_tag = axml.intern_plain_string("activity");
+        let svc_tag = axml.intern_plain_string("service");
+        let alias_tag = axml.intern_plain_string("activity-alias");
+        let prov_tag = axml.intern_plain_string("provider");
+
+        let dot_main = axml.intern_plain_string(".MainActivity");
+        let bare_svc = axml.intern_plain_string("WorkerService");
+        let ext_act = axml.intern_plain_string("com.unity3d.player.UnityPlayerActivity");
+        let auth_val = axml.intern_plain_string("com.test.utf16.fileprovider;com.other.auth");
+        let prov_cls = axml.intern_plain_string("androidx.core.content.FileProvider");
+
+        let inserts = vec![
+            build_start_element_chunk(
+                act_tag,
+                vec![ElementAttr {
+                    ns: android_ns,
+                    name: attr_name,
+                    res_id: ATTR_RES_NAME,
+                    raw_value: dot_main,
+                    data_type: ATTR_TYPE_STRING,
+                    data: dot_main,
+                }],
+            ),
+            build_end_element_chunk(act_tag),
+            build_start_element_chunk(
+                act_tag,
+                vec![ElementAttr {
+                    ns: android_ns,
+                    name: attr_name,
+                    res_id: ATTR_RES_NAME,
+                    raw_value: ext_act,
+                    data_type: ATTR_TYPE_STRING,
+                    data: ext_act,
+                }],
+            ),
+            build_end_element_chunk(act_tag),
+            build_start_element_chunk(
+                svc_tag,
+                vec![ElementAttr {
+                    ns: android_ns,
+                    name: attr_name,
+                    res_id: ATTR_RES_NAME,
+                    raw_value: bare_svc,
+                    data_type: ATTR_TYPE_STRING,
+                    data: bare_svc,
+                }],
+            ),
+            build_end_element_chunk(svc_tag),
+            build_start_element_chunk(
+                alias_tag,
+                vec![
+                    ElementAttr {
+                        ns: android_ns,
+                        name: attr_name,
+                        res_id: ATTR_RES_NAME,
+                        raw_value: dot_main,
+                        data_type: ATTR_TYPE_STRING,
+                        data: dot_main,
+                    },
+                    ElementAttr {
+                        ns: android_ns,
+                        name: attr_target,
+                        res_id: ATTR_RES_TARGET_ACTIVITY,
+                        raw_value: dot_main,
+                        data_type: ATTR_TYPE_STRING,
+                        data: dot_main,
+                    },
+                ],
+            ),
+            build_end_element_chunk(alias_tag),
+            build_start_element_chunk(
+                prov_tag,
+                vec![
+                    ElementAttr {
+                        ns: android_ns,
+                        name: attr_name,
+                        res_id: ATTR_RES_NAME,
+                        raw_value: prov_cls,
+                        data_type: ATTR_TYPE_STRING,
+                        data: prov_cls,
+                    },
+                    ElementAttr {
+                        ns: android_ns,
+                        name: attr_auth,
+                        res_id: ATTR_RES_AUTHORITIES,
+                        raw_value: auth_val,
+                        data_type: ATTR_TYPE_STRING,
+                        data: auth_val,
+                    },
+                ],
+            ),
+            build_end_element_chunk(prov_tag),
+        ];
+        axml.chunks.splice(3..3, inserts);
+        let orig = serialize_axml(&axml);
+
+        // Invalid package names rejected
+        assert!(rename_package_axml(&orig, "singleword").is_err());
+        assert!(rename_package_axml(&orig, "com.123bad.app").is_err());
+        assert!(rename_package_axml(&orig, "com..double").is_err());
+
+        // Same package name is a strict no-op
+        assert_eq!(rename_package_axml(&orig, "com.test.utf16").unwrap(), orig);
+
+        let renamed = rename_package_axml(&orig, "com.sidebyside.handapp").unwrap();
+        let inspected = inspect_axml(&renamed).unwrap();
+        assert_eq!(inspected.package.as_deref(), Some("com.sidebyside.handapp"));
+
+        let parsed = parse_axml(&renamed).unwrap();
+        let strings = &parsed.string_pool.strings;
+        assert!(strings.iter().any(|s| s == "com.test.utf16.MainActivity"));
+        assert!(strings.iter().any(|s| s == "com.test.utf16.WorkerService"));
+        assert!(strings.iter().any(|s| s == "com.unity3d.player.UnityPlayerActivity"));
+        assert!(strings
+            .iter()
+            .any(|s| s == "com.sidebyside.handapp.fileprovider;com.other.auth"));
+        assert!(strings.iter().any(|s| s == "androidx.core.content.FileProvider"));
+    }
 }
+
 

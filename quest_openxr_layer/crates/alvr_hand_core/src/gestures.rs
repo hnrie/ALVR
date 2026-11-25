@@ -322,7 +322,8 @@ impl HandGestureEngine {
     }
 
     /// Evaluates the 8 ALVR gestures (`[ThumbIndexPinch, ThumbMiddlePinch, ThumbRingPinch,
-    /// ThumbLittlePinch, GripCurl, ThumbCurl, JoystickX, JoystickY]`) verbatim for one hand.
+    /// ThumbLittlePinch, GripCurl, ThumbCurl, JoystickX, JoystickY]`) verbatim for one hand,
+    /// assuming all 26 joints are position- and orientation-valid.
     pub fn evaluate_gestures(
         &mut self,
         hand: HandSide,
@@ -330,204 +331,216 @@ impl HandGestureEngine {
         now_ms: u64,
         cfg: &HandTrackingInteractionConfig,
     ) -> [HandGesture; 8] {
-        let gj = joints;
+        let samples = std::array::from_fn(|i| crate::pose::HandJointSample {
+            pose: joints[i],
+            position_valid: true,
+            orientation_valid: true,
+            position_tracked: true,
+            orientation_tracked: true,
+            radius: 0.0,
+            linear_velocity: None,
+            angular_velocity: None,
+        });
+        self.evaluate_gestures_samples(hand, &samples, now_ms, cfg)
+    }
+
+    /// Evaluates the 8 ALVR gestures honoring per-joint `position_valid` / `orientation_valid`
+    /// flags from `xrLocateHandJointsEXT`.
+    ///
+    /// Occluded or untracked joints with `position_valid == false` (which OpenXR runtimes often
+    /// zero-fill to `(0, 0, 0)`) are treated as out-of-range / `0.0` so they never false-trigger
+    /// pinches, curls, or joystick deflections.
+    pub fn evaluate_gestures_samples(
+        &mut self,
+        hand: HandSide,
+        samples: &[crate::pose::HandJointSample; HAND_JOINT_COUNT],
+        now_ms: u64,
+        cfg: &HandTrackingInteractionConfig,
+    ) -> [HandGesture; 8] {
+        let pos_ok = |j: HandJoint| -> bool {
+            let s = &samples[j.idx()];
+            s.position_valid && s.pose.position.is_finite()
+        };
+        let ori_ok = |j: HandJoint| -> bool {
+            let s = &samples[j.idx()];
+            s.orientation_valid && is_valid_quat(s.pose.orientation)
+        };
+        let pose_of = |j: HandJoint| -> Pose { samples[j.idx()].pose };
 
         let pinch_min = cfg.pinch_touch_distance * 0.01;
         let pinch_max = cfg.pinch_trigger_distance * 0.01;
         let curl_min = cfg.curl_touch_distance * 0.01;
         let curl_max = cfg.curl_trigger_distance * 0.01;
 
-        let palm = gj[HandJoint::Palm.idx()];
-        let thumb_tip = gj[HandJoint::ThumbTip.idx()];
-        let index_metacarpal = gj[HandJoint::IndexMetacarpal.idx()];
-        let index_proximal = gj[HandJoint::IndexProximal.idx()];
-        let index_intermediate = gj[HandJoint::IndexIntermediate.idx()];
-        let index_distal = gj[HandJoint::IndexDistal.idx()];
-        let index_tip = gj[HandJoint::IndexTip.idx()];
-        let middle_metacarpal = gj[HandJoint::MiddleMetacarpal.idx()];
-        let middle_proximal = gj[HandJoint::MiddleProximal.idx()];
-        let middle_tip = gj[HandJoint::MiddleTip.idx()];
-        let ring_metacarpal = gj[HandJoint::RingMetacarpal.idx()];
-        let ring_proximal = gj[HandJoint::RingProximal.idx()];
-        let ring_tip = gj[HandJoint::RingTip.idx()];
-        let little_metacarpal = gj[HandJoint::LittleMetacarpal.idx()];
-        let little_proximal = gj[HandJoint::LittleProximal.idx()];
-        let little_tip = gj[HandJoint::LittleTip.idx()];
+        let palm = pose_of(HandJoint::Palm);
+        let thumb_tip = pose_of(HandJoint::ThumbTip);
+        let index_metacarpal = pose_of(HandJoint::IndexMetacarpal);
+        let index_proximal = pose_of(HandJoint::IndexProximal);
+        let index_intermediate = pose_of(HandJoint::IndexIntermediate);
+        let index_distal = pose_of(HandJoint::IndexDistal);
+        let index_tip = pose_of(HandJoint::IndexTip);
+        let middle_metacarpal = pose_of(HandJoint::MiddleMetacarpal);
+        let middle_proximal = pose_of(HandJoint::MiddleProximal);
+        let middle_tip = pose_of(HandJoint::MiddleTip);
+        let ring_metacarpal = pose_of(HandJoint::RingMetacarpal);
+        let ring_proximal = pose_of(HandJoint::RingProximal);
+        let ring_tip = pose_of(HandJoint::RingTip);
+        let little_metacarpal = pose_of(HandJoint::LittleMetacarpal);
+        let little_proximal = pose_of(HandJoint::LittleProximal);
+        let little_tip = pose_of(HandJoint::LittleTip);
 
-        // 1. Four debounced pinches
-        let pinch_idx = HandGesture {
-            id: HandGestureId::ThumbIndexPinch,
-            active: self.is_gesture_active(
+        let thumb_pos_ok = pos_ok(HandJoint::ThumbTip);
+
+        // 1. Four debounced pinches (guarded by per-joint position_valid)
+        let mut eval_pinch = |id: HandGestureId,
+                              pinch_idx: usize,
+                              finger_joint: HandJoint,
+                              finger_pose: Pose,
+                              finger_radius: f32|
+         -> HandGesture {
+            let pair_valid = thumb_pos_ok && pos_ok(finger_joint);
+            let in_range = pair_valid
+                && test_gesture_dist(
+                    thumb_tip,
+                    THUMB_RADIUS,
+                    finger_pose,
+                    finger_radius,
+                    pinch_max,
+                );
+            let active = self.update_pinch_debounce(
                 hand,
-                0,
-                thumb_tip,
-                THUMB_RADIUS,
-                index_tip,
-                INDEX_RADIUS,
-                pinch_max,
+                pinch_idx,
+                in_range,
                 cfg.repeat_delay,
                 cfg.activation_delay,
                 cfg.deactivation_delay,
                 now_ms,
-            ),
-            clicked: test_gesture_dist(thumb_tip, THUMB_RADIUS, index_tip, INDEX_RADIUS, pinch_min),
-            touching: test_gesture_dist(
-                thumb_tip,
-                THUMB_RADIUS,
-                index_tip,
-                INDEX_RADIUS,
-                pinch_max,
-            ),
-            value: get_gesture_hover(
-                thumb_tip,
-                THUMB_RADIUS,
-                index_tip,
-                INDEX_RADIUS,
-                pinch_min,
-                pinch_max,
-            ),
+            );
+            let clicked = pair_valid
+                && test_gesture_dist(
+                    thumb_tip,
+                    THUMB_RADIUS,
+                    finger_pose,
+                    finger_radius,
+                    pinch_min,
+                );
+            let value = if pair_valid {
+                get_gesture_hover(
+                    thumb_tip,
+                    THUMB_RADIUS,
+                    finger_pose,
+                    finger_radius,
+                    pinch_min,
+                    pinch_max,
+                )
+            } else {
+                0.0
+            };
+            HandGesture {
+                id,
+                active,
+                clicked,
+                touching: in_range,
+                value,
+            }
         };
 
-        let pinch_mid = HandGesture {
-            id: HandGestureId::ThumbMiddlePinch,
-            active: self.is_gesture_active(
-                hand,
-                1,
-                thumb_tip,
-                THUMB_RADIUS,
-                middle_tip,
-                MIDDLE_RADIUS,
-                pinch_max,
-                cfg.repeat_delay,
-                cfg.activation_delay,
-                cfg.deactivation_delay,
-                now_ms,
-            ),
-            clicked: test_gesture_dist(
-                thumb_tip,
-                THUMB_RADIUS,
-                middle_tip,
-                MIDDLE_RADIUS,
-                pinch_min,
-            ),
-            touching: test_gesture_dist(
-                thumb_tip,
-                THUMB_RADIUS,
-                middle_tip,
-                MIDDLE_RADIUS,
-                pinch_max,
-            ),
-            value: get_gesture_hover(
-                thumb_tip,
-                THUMB_RADIUS,
-                middle_tip,
-                MIDDLE_RADIUS,
-                pinch_min,
-                pinch_max,
-            ),
-        };
-
-        let pinch_ring = HandGesture {
-            id: HandGestureId::ThumbRingPinch,
-            active: self.is_gesture_active(
-                hand,
-                2,
-                thumb_tip,
-                THUMB_RADIUS,
-                ring_tip,
-                RING_RADIUS,
-                pinch_max,
-                cfg.repeat_delay,
-                cfg.activation_delay,
-                cfg.deactivation_delay,
-                now_ms,
-            ),
-            clicked: test_gesture_dist(thumb_tip, THUMB_RADIUS, ring_tip, RING_RADIUS, pinch_min),
-            touching: test_gesture_dist(thumb_tip, THUMB_RADIUS, ring_tip, RING_RADIUS, pinch_max),
-            value: get_gesture_hover(
-                thumb_tip,
-                THUMB_RADIUS,
-                ring_tip,
-                RING_RADIUS,
-                pinch_min,
-                pinch_max,
-            ),
-        };
-
-        let pinch_little = HandGesture {
-            id: HandGestureId::ThumbLittlePinch,
-            active: self.is_gesture_active(
-                hand,
-                3,
-                thumb_tip,
-                THUMB_RADIUS,
-                little_tip,
-                LITTLE_RADIUS,
-                pinch_max,
-                cfg.repeat_delay,
-                cfg.activation_delay,
-                cfg.deactivation_delay,
-                now_ms,
-            ),
-            clicked: test_gesture_dist(
-                thumb_tip,
-                THUMB_RADIUS,
-                little_tip,
-                LITTLE_RADIUS,
-                pinch_min,
-            ),
-            touching: test_gesture_dist(
-                thumb_tip,
-                THUMB_RADIUS,
-                little_tip,
-                LITTLE_RADIUS,
-                pinch_max,
-            ),
-            value: get_gesture_hover(
-                thumb_tip,
-                THUMB_RADIUS,
-                little_tip,
-                LITTLE_RADIUS,
-                pinch_min,
-                pinch_max,
-            ),
-        };
-
-        // 2. Finger curls & GripCurl
-        let thumb_curl =
-            get_gesture_hover(palm, PALM_DEPTH, thumb_tip, THUMB_RADIUS, curl_min, curl_max);
-        let index_curl = get_gesture_hover(
-            lerp_pose(index_metacarpal, index_proximal, 0.5),
-            PALM_DEPTH,
+        let pinch_idx = eval_pinch(
+            HandGestureId::ThumbIndexPinch,
+            0,
+            HandJoint::IndexTip,
             index_tip,
             INDEX_RADIUS,
-            curl_min,
-            curl_max,
         );
-        let middle_curl = get_gesture_hover(
-            lerp_pose(middle_metacarpal, middle_proximal, 0.5),
-            PALM_DEPTH,
+        let pinch_mid = eval_pinch(
+            HandGestureId::ThumbMiddlePinch,
+            1,
+            HandJoint::MiddleTip,
             middle_tip,
             MIDDLE_RADIUS,
-            curl_min,
-            curl_max,
         );
-        let ring_curl = get_gesture_hover(
-            lerp_pose(ring_metacarpal, ring_proximal, 0.5),
-            PALM_DEPTH,
+        let pinch_ring = eval_pinch(
+            HandGestureId::ThumbRingPinch,
+            2,
+            HandJoint::RingTip,
             ring_tip,
             RING_RADIUS,
-            curl_min,
-            curl_max,
         );
-        let little_curl = get_gesture_hover(
-            lerp_pose(little_metacarpal, little_proximal, 0.5),
-            PALM_DEPTH,
+        let pinch_little = eval_pinch(
+            HandGestureId::ThumbLittlePinch,
+            3,
+            HandJoint::LittleTip,
             little_tip,
             LITTLE_RADIUS,
-            curl_min,
-            curl_max,
         );
+
+        // 2. Finger curls & GripCurl (guarded by per-joint position_valid)
+        let thumb_curl_valid = pos_ok(HandJoint::Palm) && thumb_pos_ok;
+        let thumb_curl = if thumb_curl_valid {
+            get_gesture_hover(palm, PALM_DEPTH, thumb_tip, THUMB_RADIUS, curl_min, curl_max)
+        } else {
+            0.0
+        };
+        let index_curl = if pos_ok(HandJoint::IndexMetacarpal)
+            && pos_ok(HandJoint::IndexProximal)
+            && pos_ok(HandJoint::IndexTip)
+        {
+            get_gesture_hover(
+                lerp_pose(index_metacarpal, index_proximal, 0.5),
+                PALM_DEPTH,
+                index_tip,
+                INDEX_RADIUS,
+                curl_min,
+                curl_max,
+            )
+        } else {
+            0.0
+        };
+        let middle_curl = if pos_ok(HandJoint::MiddleMetacarpal)
+            && pos_ok(HandJoint::MiddleProximal)
+            && pos_ok(HandJoint::MiddleTip)
+        {
+            get_gesture_hover(
+                lerp_pose(middle_metacarpal, middle_proximal, 0.5),
+                PALM_DEPTH,
+                middle_tip,
+                MIDDLE_RADIUS,
+                curl_min,
+                curl_max,
+            )
+        } else {
+            0.0
+        };
+        let ring_curl = if pos_ok(HandJoint::RingMetacarpal)
+            && pos_ok(HandJoint::RingProximal)
+            && pos_ok(HandJoint::RingTip)
+        {
+            get_gesture_hover(
+                lerp_pose(ring_metacarpal, ring_proximal, 0.5),
+                PALM_DEPTH,
+                ring_tip,
+                RING_RADIUS,
+                curl_min,
+                curl_max,
+            )
+        } else {
+            0.0
+        };
+        let little_curl = if pos_ok(HandJoint::LittleMetacarpal)
+            && pos_ok(HandJoint::LittleProximal)
+            && pos_ok(HandJoint::LittleTip)
+        {
+            get_gesture_hover(
+                lerp_pose(little_metacarpal, little_proximal, 0.5),
+                PALM_DEPTH,
+                little_tip,
+                LITTLE_RADIUS,
+                curl_min,
+                curl_max,
+            )
+        } else {
+            0.0
+        };
 
         let grip_curl = (middle_curl + ring_curl + little_curl) / 3.0;
         let grip = HandGesture {
@@ -540,17 +553,20 @@ impl HandGestureEngine {
 
         let thumb = HandGesture {
             id: HandGestureId::ThumbCurl,
-            active: thumb_curl >= 0.0,
-            touching: thumb_curl >= 0.0,
-            clicked: thumb_curl >= 0.5,
+            active: thumb_curl_valid && thumb_curl >= 0.0,
+            touching: thumb_curl_valid && thumb_curl >= 0.0,
+            clicked: thumb_curl_valid && thumb_curl >= 0.5,
             value: thumb_curl,
         };
 
         // 3. Joystick (4-gate contact, handedness mirroring, square per-axis deadzone)
         let joystick_range = cfg.joystick_range * 0.01;
         let joy_range_valid = joystick_range.is_finite() && joystick_range > 1e-9;
-        let joy_ori_valid = is_valid_quat(index_intermediate.orientation)
-            && is_valid_quat(index_distal.orientation);
+        let joy_joints_valid = thumb_pos_ok
+            && pos_ok(HandJoint::IndexIntermediate)
+            && pos_ok(HandJoint::IndexDistal)
+            && ori_ok(HandJoint::IndexIntermediate)
+            && ori_ok(HandJoint::IndexDistal);
 
         let joystick_center = lerp_pose(index_intermediate, index_distal, 0.5);
         let idx_inter_ori = normalize_quat_or_identity(index_intermediate.orientation);
@@ -583,7 +599,7 @@ impl HandGestureEngine {
             0.0
         };
 
-        let joystick_pos = if joy_range_valid && joy_ori_valid {
+        let joystick_pos = if joy_range_valid && joy_joints_valid {
             get_joystick_values(
                 joystick_center,
                 thumb_tip,
@@ -598,13 +614,14 @@ impl HandGestureEngine {
         };
 
         let dist_gate = joy_range_valid
+            && joy_joints_valid
             && joystick_center.position.is_finite()
             && thumb_tip.position.is_finite()
             && joystick_center.position.distance(thumb_tip.position) <= joystick_range * 3.0;
 
         let up_len = joystick_up.length();
         let up_gate = if joy_range_valid
-            && joy_ori_valid
+            && joy_joints_valid
             && joystick_center.position.is_finite()
             && thumb_tip.position.is_finite()
             && up_len > 1e-9
@@ -659,12 +676,34 @@ impl HandGestureEngine {
         ]
     }
 
-    /// Evaluates one hand's 26-joint skeleton and projects all ALVR gesture bindings into
-    /// a [`VirtualHandState`] snapshot.
+    /// Evaluates one hand's 26-joint skeleton (assuming all joints valid) and projects all ALVR
+    /// gesture bindings into a [`VirtualHandState`] snapshot.
     pub fn update_hand(
         &mut self,
         hand: HandSide,
         joints: &[Pose; HAND_JOINT_COUNT],
+        now_ms: u64,
+        cfg: &LayerConfig,
+    ) -> VirtualHandState {
+        let samples = std::array::from_fn(|i| crate::pose::HandJointSample {
+            pose: joints[i],
+            position_valid: true,
+            orientation_valid: true,
+            position_tracked: true,
+            orientation_tracked: true,
+            radius: 0.0,
+            linear_velocity: None,
+            angular_velocity: None,
+        });
+        self.update_hand_samples(hand, &samples, now_ms, cfg)
+    }
+
+    /// Evaluates one hand's 26-joint `HandJointSample` array honoring per-joint validity flags,
+    /// and projects all ALVR gesture bindings into a [`VirtualHandState`] snapshot.
+    pub fn update_hand_samples(
+        &mut self,
+        hand: HandSide,
+        samples: &[crate::pose::HandJointSample; HAND_JOINT_COUNT],
         now_ms: u64,
         cfg: &LayerConfig,
     ) -> VirtualHandState {
@@ -673,7 +712,7 @@ impl HandGestureEngine {
         }
 
         let [pinch_idx, pinch_mid, pinch_ring, pinch_lit, grip, thumb_curl, joy_x, joy_y] =
-            self.evaluate_gestures(hand, joints, now_ms, &cfg.gestures);
+            self.evaluate_gestures_samples(hand, samples, now_ms, &cfg.gestures);
 
         let only_touch = cfg.gestures.only_touch;
         let trigger_click = !only_touch && pinch_idx.active && pinch_idx.clicked;
@@ -755,28 +794,16 @@ impl HandGestureEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn is_gesture_active(
+    fn update_pinch_debounce(
         &mut self,
         hand: HandSide,
         pinch_idx: usize,
-        first_anchor: Pose,
-        first_radius: f32,
-        second_anchor: Pose,
-        second_radius: f32,
-        activation_dist: f32,
+        in_range: bool,
         repeat_delay: u32,
         in_delay: u32,
         out_delay: u32,
         now_ms: u64,
     ) -> bool {
-        let in_range = test_gesture_dist(
-            first_anchor,
-            first_radius,
-            second_anchor,
-            second_radius,
-            activation_dist,
-        );
-
         let g = &mut self.hand_state_mut(hand).pinches[pinch_idx];
 
         if in_range {
@@ -1543,5 +1570,65 @@ mod tests {
         engine.reset();
         assert!(!engine.trigger_hysteresis_pressed(HandSide::Left));
         assert!(!engine.squeeze_hysteresis_pressed(HandSide::Left));
+    }
+
+    #[test]
+    fn occluded_invalid_zeroed_joints_never_false_trigger_gestures() {
+        let cfg = LayerConfig::default();
+        let mut engine = HandGestureEngine::new();
+
+        // All joints defaulted (position_valid = false, pose = IDENTITY at (0,0,0)):
+        // Previously passing raw poses caused distance 0.0 -> EVERY pinch/curl fired!
+        let invalid_all = [crate::pose::HandJointSample::default(); HAND_JOINT_COUNT];
+        let _ = engine.update_hand_samples(HandSide::Left, &invalid_all, 0, &cfg);
+        let s = engine.update_hand_samples(HandSide::Left, &invalid_all, 80, &cfg);
+        assert!(s.tracked);
+        assert!(!s.trigger_click && !s.trigger_touch && s.trigger_value == 0.0);
+        assert!(!s.primary_click && !s.primary_touch);
+        assert!(!s.secondary_click && !s.secondary_touch);
+        assert!(!s.menu_click && !s.select_click);
+        assert!(!s.squeeze_click && s.squeeze_value == 0.0);
+        assert!(!s.thumbstick_click && !s.thumbstick_touch && s.thumbstick == Vec2::ZERO);
+
+        // Partially occluded hand: open valid hand, EXCEPT index tip & thumb tip lose position_valid
+        // and get zeroed to (0,0,0) -> MUST NOT trigger pinch or index curl!
+        let open = open_hand_skeleton();
+        let mut samples = std::array::from_fn(|i| crate::pose::HandJointSample {
+            pose: open[i],
+            position_valid: true,
+            orientation_valid: true,
+            position_tracked: true,
+            orientation_tracked: true,
+            radius: 0.008,
+            linear_velocity: None,
+            angular_velocity: None,
+        });
+        samples[HandJoint::ThumbTip.idx()].pose = Pose::IDENTITY;
+        samples[HandJoint::ThumbTip.idx()].position_valid = false;
+        samples[HandJoint::IndexTip.idx()].pose = Pose::IDENTITY;
+        samples[HandJoint::IndexTip.idx()].position_valid = false;
+
+        let _ = engine.update_hand_samples(HandSide::Left, &samples, 100, &cfg);
+        let s2 = engine.update_hand_samples(HandSide::Left, &samples, 200, &cfg);
+        assert!(!s2.trigger_click && !s2.trigger_touch && s2.trigger_value == 0.0);
+        assert!(!s2.thumbstick_click && !s2.thumbstick_touch);
+
+        // Active pinch followed by joint occlusion exits cleanly after deactivation_delay
+        let mut pinched = samples;
+        pinched[HandJoint::ThumbTip.idx()].pose = pose_at(0.0, 0.0, 0.0);
+        pinched[HandJoint::ThumbTip.idx()].position_valid = true;
+        pinched[HandJoint::IndexTip.idx()].pose = pose_at(0.008, 0.0, 0.0);
+        pinched[HandJoint::IndexTip.idx()].position_valid = true;
+        let _ = engine.update_hand_samples(HandSide::Left, &pinched, 300, &cfg);
+        let s_on = engine.update_hand_samples(HandSide::Left, &pinched, 360, &cfg);
+        assert!(s_on.trigger_click);
+
+        // Now occlude index tip -> value drops immediately, debounce deactivates after > 100ms
+        let mut occluded = pinched;
+        occluded[HandJoint::IndexTip.idx()].position_valid = false;
+        let s_occ0 = engine.update_hand_samples(HandSide::Left, &occluded, 400, &cfg);
+        assert!(!s_occ0.trigger_click && s_occ0.trigger_value == 0.0);
+        let s_occ1 = engine.update_hand_samples(HandSide::Left, &occluded, 505, &cfg);
+        assert!(!s_occ1.trigger_click && !s_occ1.trigger_touch && s_occ1.trigger_value == 0.0);
     }
 }

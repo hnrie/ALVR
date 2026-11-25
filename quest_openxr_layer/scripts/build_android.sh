@@ -3,26 +3,64 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/home/antigravity/.local/android-ndk-r26b}"
-TOOLCHAIN_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-LINKER="${TOOLCHAIN_BIN}/aarch64-linux-android28-clang"
-AR="${TOOLCHAIN_BIN}/llvm-ar"
 
-if [[ ! -x "${LINKER}" ]]; then
-    echo "error: Android NDK linker not found at ${LINKER}" >&2
-    echo "Run ${SCRIPT_DIR}/setup_android_env.sh first." >&2
+find_ndk() {
+    local candidates=()
+    if [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
+        candidates+=("${ANDROID_NDK_HOME}")
+    fi
+    if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" ]]; then
+        candidates+=("${ANDROID_NDK_LATEST_HOME}")
+    fi
+    if [[ -n "${ANDROID_NDK_ROOT:-}" ]]; then
+        candidates+=("${ANDROID_NDK_ROOT}")
+    fi
+    shopt -s nullglob
+    for d in /opt/android-sdk/ndk/* "${ANDROID_SDK_ROOT:-/nonexistent}"/ndk/* "${ANDROID_HOME:-/nonexistent}"/ndk/* "${HOME}"/.local/android-ndk-*; do
+        candidates+=("${d}")
+    done
+    shopt -u nullglob
+
+    local host_tag="linux-x86_64"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        host_tag="darwin-x86_64"
+    fi
+
+    for cand in "${candidates[@]}"; do
+        if [[ -x "${cand}/toolchains/llvm/prebuilt/${host_tag}/bin/aarch64-linux-android28-clang" ]]; then
+            echo "${cand}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ANDROID_NDK_HOME="$(find_ndk || true)"
+if [[ -z "${ANDROID_NDK_HOME}" ]]; then
+    echo "error: Android NDK (r26+) not found. Set ANDROID_NDK_HOME or install NDK under /opt/android-sdk/ndk/." >&2
     exit 1
 fi
 
-echo "==> [1/5] Building host x86_64 workspace (xr_api_layer + alvr-xr-packager)..."
-cargo build --offline --manifest-path "${ROOT_DIR}/Cargo.toml"
-cargo build --offline --release --manifest-path "${ROOT_DIR}/Cargo.toml"
+HOST_TAG="linux-x86_64"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    HOST_TAG="darwin-x86_64"
+fi
+
+TOOLCHAIN_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin"
+LINKER="${TOOLCHAIN_BIN}/aarch64-linux-android28-clang"
+AR="${TOOLCHAIN_BIN}/llvm-ar"
+
+echo "==> Using Android NDK: ${ANDROID_NDK_HOME}"
+
+echo "==> [1/5] Building host workspace (xr_api_layer + alvr-xr-packager)..."
+cargo build --manifest-path "${ROOT_DIR}/Cargo.toml" -p xr_api_layer -p android_packager
+cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml" -p xr_api_layer -p android_packager
 
 echo "==> [2/5] Cross-compiling libXrApiLayer_alvr_hand_emulation.so for aarch64-linux-android..."
 env -u CPATH -u LIBRARY_PATH -u PKG_CONFIG_LIBDIR \
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${LINKER}" \
     CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="${AR}" \
-    cargo build --offline --target aarch64-linux-android --release \
+    cargo build --target aarch64-linux-android --release \
         -p xr_api_layer --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 ANDROID_SO="${ROOT_DIR}/target/aarch64-linux-android/release/libXrApiLayer_alvr_hand_emulation.so"

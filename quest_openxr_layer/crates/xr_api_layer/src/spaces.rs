@@ -108,7 +108,9 @@ pub unsafe extern "system" fn layer_destroy_space(space: xr::Space) -> xr::Resul
         if res == xr::Result::SUCCESS {
             let raw = space.into_raw();
             SPACES.write().remove(&raw);
-            meta.session.inner.lock().spaces.retain(|&s| s != raw);
+            let mut inner = meta.session.inner.lock();
+            inner.spaces.retain(|&s| s != raw);
+            inner.pose_synthesizer.clear_base_space(raw);
         }
         res
     })
@@ -133,6 +135,9 @@ pub unsafe extern "system" fn layer_locate_space(
         let Some(base_meta) = get_space(base_space) else {
             return xr::Result::ERROR_HANDLE_INVALID;
         };
+        if space_meta.session.handle != base_meta.session.handle {
+            return xr::Result::ERROR_HANDLE_INVALID;
+        }
 
         let sess = Arc::clone(&space_meta.session);
         sess.inner.lock().clock.observe_xr_time(time.as_nanos());
@@ -140,7 +145,7 @@ pub unsafe extern "system" fn layer_locate_space(
         let vel_ptr = find_space_velocity_mut((*location).next);
         let want_vel = !vel_ptr.is_null();
 
-        match locate_space_pair(&sess, &space_meta, &base_meta, time, want_vel) {
+        match locate_space_pair(&sess, &space_meta, &base_meta, time, want_vel, None) {
             LocateOutcome::Passthrough => {
                 (sess.instance.next.locate_space)(space, base_space, time, location)
             }
@@ -173,6 +178,25 @@ pub unsafe extern "system" fn layer_locate_spaces_khr(
     space_locations: *mut xr::SpaceLocations,
 ) -> xr::Result {
     crate::ffi_guard(|| locate_spaces_impl(session, locate_info, space_locations, true))
+}
+
+/// Per-batch cache avoiding redundant `xrLocateHandJointsEXT` FFI calls when a single
+/// `xrLocateSpaces` batch locates multiple spaces (e.g. grip + aim + palm) for the same hand
+/// in the same `baseSpace` at the same `time`.
+struct BatchHandCache {
+    base_space: xr::Space,
+    want_fb_aim: [bool; 2],
+    located: [Option<Option<crate::hand_tracking::LocatedHand>>; 2],
+}
+
+impl BatchHandCache {
+    fn new(base_space: xr::Space, want_fb_aim: [bool; 2]) -> Self {
+        Self {
+            base_space,
+            want_fb_aim,
+            located: [None, None],
+        }
+    }
 }
 
 unsafe fn locate_spaces_impl(
@@ -213,6 +237,9 @@ unsafe fn locate_spaces_impl(
     let Some(base_meta) = get_space(info.base_space) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
+    if base_meta.session.handle != session {
+        return xr::Result::ERROR_HANDLE_INVALID;
+    }
 
     sess.inner
         .lock()
@@ -225,6 +252,9 @@ unsafe fn locate_spaces_impl(
         let Some(m) = get_space(sp) else {
             return xr::Result::ERROR_HANDLE_INVALID;
         };
+        if m.session.handle != session {
+            return xr::Result::ERROR_HANDLE_INVALID;
+        }
         space_metas.push(m);
     }
 
@@ -240,12 +270,27 @@ unsafe fn locate_spaces_impl(
             .or(sess.instance.next.locate_spaces_khr)
     };
 
-    // Evaluate whether any slot needs synthesis.
-    let base_emulated = resolve_emulated_space_target(&sess, &base_meta).is_some();
-    let any_slot_emulated = base_emulated
-        || space_metas
-            .iter()
-            .any(|m| is_same_action_entity(&sess, m, &base_meta).is_some() || resolve_emulated_space_target(&sess, m).is_some());
+    // Evaluate whether any slot needs synthesis, and whether each hand requests FB aim in this batch.
+    let base_target_opt = resolve_emulated_space_target(&sess, &base_meta);
+    let base_emulated = base_target_opt.is_some();
+    let mut want_fb_aim_per_hand = [false; 2];
+    if let Some(bt) = base_target_opt {
+        if matches!(bt.pose_source, PoseSource::Aim) {
+            want_fb_aim_per_hand[bt.hand.index()] = true;
+        }
+    }
+    let mut any_slot_emulated = base_emulated;
+    for m in &space_metas {
+        if is_same_action_entity(&sess, m, &base_meta).is_some() {
+            any_slot_emulated = true;
+        }
+        if let Some(t) = resolve_emulated_space_target(&sess, m) {
+            any_slot_emulated = true;
+            if matches!(t.pose_source, PoseSource::Aim) {
+                want_fb_aim_per_hand[t.hand.index()] = true;
+            }
+        }
+    }
 
     if !any_slot_emulated {
         if let Some(f) = downstream_fn {
@@ -261,7 +306,14 @@ unsafe fn locate_spaces_impl(
         } else {
             None
         };
-        return fallback_locate_spaces_individual(&sess, space_handles, info.base_space, info.time, locs, vels);
+        return fallback_locate_spaces_individual(
+            &sess,
+            space_handles,
+            info.base_space,
+            info.time,
+            locs,
+            vels,
+        );
     }
 
     // If base_space is NOT emulated, run downstream batch first to populate non-emulated slots cleanly.
@@ -284,8 +336,22 @@ unsafe fn locate_spaces_impl(
         None
     };
 
+    let cache_base = if base_emulated {
+        sess.trackers.lock().local_space
+    } else {
+        base_meta.handle
+    };
+    let mut batch_cache = BatchHandCache::new(cache_base, want_fb_aim_per_hand);
+
     for (i, sp_meta) in space_metas.iter().enumerate() {
-        match locate_space_pair(&sess, sp_meta, &base_meta, info.time, want_vel) {
+        match locate_space_pair(
+            &sess,
+            sp_meta,
+            &base_meta,
+            info.time,
+            want_vel,
+            Some(&mut batch_cache),
+        ) {
             LocateOutcome::Passthrough => {
                 if base_emulated || downstream_fn.is_none() {
                     let mut single_loc = xr::SpaceLocation {
@@ -403,6 +469,7 @@ unsafe fn locate_space_pair(
     base_meta: &SpaceMeta,
     time: xr::Time,
     want_vel: bool,
+    mut batch_cache: Option<&mut BatchHandCache>,
 ) -> LocateOutcome {
     // OpenXR spec (`spaces.adoc:536-542`): if two spaces track the SAME entity,
     // MUST return VALID | TRACKED with their static offset delta even when untracked!
@@ -430,12 +497,17 @@ unsafe fn locate_space_pair(
         (None, None) => LocateOutcome::Passthrough,
 
         // Case 1: `space` is emulated, `base_space` is reference or physical.
-        (Some(target), None) => {
-            match synthesize_space_in_base(sess, target, base_meta.handle, time, want_vel) {
-                Ok(loc) => LocateOutcome::Synthesized(loc),
-                Err(e) => LocateOutcome::Error(e),
-            }
-        }
+        (Some(target), None) => match synthesize_space_in_base(
+            sess,
+            target,
+            base_meta.handle,
+            time,
+            want_vel,
+            batch_cache,
+        ) {
+            Ok(loc) => LocateOutcome::Synthesized(loc),
+            Err(e) => LocateOutcome::Error(e),
+        },
 
         // Case 2: `base_space` is emulated, `space` is reference or physical (inverted baseSpace!).
         (None, Some(base_target)) => {
@@ -443,11 +515,17 @@ unsafe fn locate_space_pair(
             if local_space == xr::Space::NULL {
                 return LocateOutcome::Passthrough;
             }
-            let base_in_local =
-                match synthesize_space_in_base(sess, base_target, local_space, time, want_vel) {
-                    Ok(loc) => loc,
-                    Err(e) => return LocateOutcome::Error(e),
-                };
+            let base_in_local = match synthesize_space_in_base(
+                sess,
+                base_target,
+                local_space,
+                time,
+                want_vel,
+                batch_cache,
+            ) {
+                Ok(loc) => loc,
+                Err(e) => return LocateOutcome::Error(e),
+            };
             let space_in_local =
                 match locate_downstream_single(sess, space_meta.handle, local_space, time, want_vel)
                 {
@@ -463,16 +541,28 @@ unsafe fn locate_space_pair(
             if local_space == xr::Space::NULL {
                 return LocateOutcome::Passthrough;
             }
-            let space_in_local =
-                match synthesize_space_in_base(sess, space_target, local_space, time, want_vel) {
-                    Ok(loc) => loc,
-                    Err(e) => return LocateOutcome::Error(e),
-                };
-            let base_in_local =
-                match synthesize_space_in_base(sess, base_target, local_space, time, want_vel) {
-                    Ok(loc) => loc,
-                    Err(e) => return LocateOutcome::Error(e),
-                };
+            let space_in_local = match synthesize_space_in_base(
+                sess,
+                space_target,
+                local_space,
+                time,
+                want_vel,
+                batch_cache.as_deref_mut(),
+            ) {
+                Ok(loc) => loc,
+                Err(e) => return LocateOutcome::Error(e),
+            };
+            let base_in_local = match synthesize_space_in_base(
+                sess,
+                base_target,
+                local_space,
+                time,
+                want_vel,
+                batch_cache,
+            ) {
+                Ok(loc) => loc,
+                Err(e) => return LocateOutcome::Error(e),
+            };
             LocateOutcome::Synthesized(compose_relative(space_in_local, base_in_local, want_vel))
         }
     }
@@ -503,8 +593,6 @@ fn is_same_action_entity(
     ) = (space_meta.kind, base_meta.kind)
     {
         if a1 == a2 && sub1 == sub2 {
-            // Only intercept when either emulation is enabled or handles refer to the same entity.
-            let _ = sess;
             return Some(p2.inverse() * p1);
         }
         // Also check if both resolve to the exact same emulated (hand, pose_source).
@@ -520,7 +608,7 @@ fn is_same_action_entity(
     None
 }
 
-/// Resolves whether `space_meta` is an action space currently being emulated by hand tracking.
+/// Resolves whether `space_meta` is an active synced action space currently being emulated by hand tracking.
 fn resolve_emulated_space_target(
     sess: &SessionState,
     space_meta: &SpaceMeta,
@@ -534,11 +622,21 @@ fn resolve_emulated_space_target(
         return None;
     };
 
-    // Snapshot session arbitration and sticky pose source under `sess.inner`, then drop lock.
-    let (focused, emulated, sticky, effective_profiles) = {
+    let act = get_action(xr::Action::from_raw(action))?;
+
+    // Snapshot session arbitration, sync state, and sticky pose source under `sess.inner`, then drop lock.
+    let (focused, is_synced, emulated, sticky, effective_profiles) = {
         let inner = sess.inner.lock();
+        let synced = inner.attached
+            && inner.attached_action_sets.contains(&act.action_set)
+            && crate::input::is_subaction_synced(
+                &inner.active_synced_sets,
+                act.action_set,
+                subaction_path,
+            );
         (
             inner.last_sync_focused,
+            synced,
             [inner.hand_arb[0].emulated, inner.hand_arb[1].emulated],
             inner.sticky_pose_source.get(&(action, subaction_path)).copied(),
             [
@@ -552,12 +650,14 @@ fn resolve_emulated_space_target(
         return None;
     }
 
-    // If session was synced unfocused, don't return stale poses (action is inactive -> passthrough/untracked).
-    if !focused {
+    // Per OpenXR spec, an action space whose session is unfocused OR whose action set/subaction
+    // was not included in the latest xrSyncActions is inactive (not tracked).
+    if !focused || !is_synced {
         return None;
     }
 
-    // Prefer the sticky source chosen during `xrSyncActions` (guarantees OpenXR single-source stability).
+    // Prefer the sticky source chosen during `xrSyncActions` (guarantees OpenXR single-source stability
+    // AND honors Action Set Priority overrides!).
     if let Some((hand, pose_source)) = sticky {
         if emulated[hand.index()] {
             return Some(EmulatedSpaceTarget {
@@ -568,8 +668,18 @@ fn resolve_emulated_space_target(
         }
     }
 
-    // Fallback: resolve directly from suggested bindings if space is queried after arbitration.
-    let _act = get_action(xr::Action::from_raw(action))?;
+    // If `action_snapshots` already determined this pose action is inactive (e.g. suppressed by
+    // a higher-priority active action set), respect that decision cleanly.
+    {
+        let inner = sess.inner.lock();
+        if let Some(snap) = inner.action_snapshots.get(&(action, subaction_path)) {
+            if !snap.is_active {
+                return None;
+            }
+        }
+    }
+
+    // Fallback: resolve directly from suggested bindings if action space was created after sync.
     let hand_filter = sess
         .instance
         .path_to_hand(xr::Path::from_raw(subaction_path));
@@ -615,44 +725,76 @@ unsafe fn synthesize_space_in_base(
     base_space: xr::Space,
     time: xr::Time,
     want_vel: bool,
+    batch_cache: Option<&mut BatchHandCache>,
 ) -> Result<LocatedResult, xr::Result> {
     let tracker = sess.trackers.lock().tracker(target.hand);
     let want_fb_aim = matches!(target.pose_source, PoseSource::Aim);
+    let h_idx = target.hand.index();
 
-    let located_opt = locate_hand_joints(
-        &sess.instance,
-        tracker,
-        base_space,
-        time,
-        want_vel,
-        want_fb_aim,
-    )?;
+    let located_opt = if let Some(cache) = batch_cache {
+        if cache.base_space == base_space {
+            if cache.located[h_idx].is_none() {
+                let res = locate_hand_joints(
+                    &sess.instance,
+                    tracker,
+                    base_space,
+                    time,
+                    want_vel,
+                    cache.want_fb_aim[h_idx] || want_fb_aim,
+                )?;
+                cache.located[h_idx] = Some(res);
+            }
+            cache.located[h_idx].as_ref().and_then(|o| o.clone())
+        } else {
+            locate_hand_joints(
+                &sess.instance,
+                tracker,
+                base_space,
+                time,
+                want_vel,
+                want_fb_aim,
+            )?
+        }
+    } else {
+        locate_hand_joints(
+            &sess.instance,
+            tracker,
+            base_space,
+            time,
+            want_vel,
+            want_fb_aim,
+        )?
+    };
 
     let Some(hand_data) = located_opt else {
         // Hand inactive (`isActive == XR_FALSE`): report untracked/invalid cleanly.
         return Ok(LocatedResult::default());
     };
 
+    let base_space_id = base_space.into_raw();
     let cfg = &sess.instance.config.pose;
     let synth: SynthesizedPose = {
         let mut inner = sess.inner.lock();
         let base_synth = match target.pose_source {
-            PoseSource::Grip => inner.pose_synthesizer.compute_grip_pose(
+            PoseSource::Grip => inner.pose_synthesizer.compute_grip_pose_in_space(
                 target.hand,
+                base_space_id,
                 &hand_data.samples,
                 time.as_nanos(),
                 cfg,
             ),
-            PoseSource::Aim => inner.pose_synthesizer.compute_aim_pose(
+            PoseSource::Aim => inner.pose_synthesizer.compute_aim_pose_in_space(
                 target.hand,
+                base_space_id,
                 &hand_data.samples,
                 hand_data.fb_aim_pose,
                 time.as_nanos(),
                 cfg,
             ),
             PoseSource::GripSurface | PoseSource::PalmExt => {
-                inner.pose_synthesizer.compute_palm_pose(
+                inner.pose_synthesizer.compute_palm_pose_in_space(
                     target.hand,
+                    base_space_id,
                     &hand_data.samples,
                     time.as_nanos(),
                 )
@@ -660,32 +802,74 @@ unsafe fn synthesize_space_in_base(
             PoseSource::PinchExt => {
                 let thumb = hand_data.samples[HandJoint::ThumbTip.idx()];
                 let index = hand_data.samples[HandJoint::IndexTip.idx()];
-                let valid = thumb.position_valid
+                let pos_valid = thumb.position_valid
                     && index.position_valid
-                    && index.orientation_valid;
+                    && thumb.pose.position.is_finite()
+                    && index.pose.position.is_finite();
+                let ori_valid =
+                    index.orientation_valid && alvr_hand_core::pose::is_valid_quat(index.pose.orientation);
+                let position = if pos_valid {
+                    (thumb.pose.position + index.pose.position) * 0.5
+                } else {
+                    Vec3::ZERO
+                };
                 SynthesizedPose {
                     pose: Pose {
-                        orientation: index.pose.orientation.normalize(),
-                        position: (thumb.pose.position + index.pose.position) * 0.5,
+                        orientation: if ori_valid {
+                            alvr_hand_core::pose::normalize_quat_or_identity(index.pose.orientation)
+                        } else {
+                            glam::Quat::IDENTITY
+                        },
+                        position,
                     },
-                    position_valid: valid,
-                    orientation_valid: index.orientation_valid,
-                    position_tracked: thumb.position_tracked && index.position_tracked,
-                    orientation_tracked: index.orientation_tracked,
-                    linear_velocity: index.linear_velocity,
-                    angular_velocity: index.angular_velocity,
+                    position_valid: pos_valid,
+                    orientation_valid: ori_valid,
+                    position_tracked: pos_valid && thumb.position_tracked && index.position_tracked,
+                    orientation_tracked: ori_valid && index.orientation_tracked,
+                    linear_velocity: if pos_valid {
+                        index.linear_velocity.filter(|v| v.is_finite())
+                    } else {
+                        None
+                    },
+                    angular_velocity: if ori_valid {
+                        index.angular_velocity.filter(|w| w.is_finite())
+                    } else {
+                        None
+                    },
                 }
             }
             PoseSource::PokeExt => {
                 let index = hand_data.samples[HandJoint::IndexTip.idx()];
+                let pos_valid = index.position_valid && index.pose.position.is_finite();
+                let ori_valid =
+                    index.orientation_valid && alvr_hand_core::pose::is_valid_quat(index.pose.orientation);
                 SynthesizedPose {
-                    pose: index.pose.normalize_or_identity(),
-                    position_valid: index.position_valid,
-                    orientation_valid: index.orientation_valid,
-                    position_tracked: index.position_tracked,
-                    orientation_tracked: index.orientation_tracked,
-                    linear_velocity: index.linear_velocity,
-                    angular_velocity: index.angular_velocity,
+                    pose: Pose {
+                        orientation: if ori_valid {
+                            alvr_hand_core::pose::normalize_quat_or_identity(index.pose.orientation)
+                        } else {
+                            glam::Quat::IDENTITY
+                        },
+                        position: if pos_valid {
+                            index.pose.position
+                        } else {
+                            Vec3::ZERO
+                        },
+                    },
+                    position_valid: pos_valid,
+                    orientation_valid: ori_valid,
+                    position_tracked: pos_valid && index.position_tracked,
+                    orientation_tracked: ori_valid && index.orientation_tracked,
+                    linear_velocity: if pos_valid {
+                        index.linear_velocity.filter(|v| v.is_finite())
+                    } else {
+                        None
+                    },
+                    angular_velocity: if ori_valid {
+                        index.angular_velocity.filter(|w| w.is_finite())
+                    } else {
+                        None
+                    },
                 }
             }
         };
@@ -791,14 +975,18 @@ fn compose_relative(
         .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
         && base
             .location_flags
-            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID);
+            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+        && alvr_hand_core::pose::is_valid_quat(space.pose.orientation)
+        && alvr_hand_core::pose::is_valid_quat(base.pose.orientation);
     let pos_valid = ori_valid
         && space
             .location_flags
             .contains(xr::SpaceLocationFlags::POSITION_VALID)
         && base
             .location_flags
-            .contains(xr::SpaceLocationFlags::POSITION_VALID);
+            .contains(xr::SpaceLocationFlags::POSITION_VALID)
+        && space.pose.position.is_finite()
+        && base.pose.position.is_finite();
     let ori_tracked = ori_valid
         && space
             .location_flags
@@ -828,12 +1016,14 @@ fn compose_relative(
         location_flags |= xr::SpaceLocationFlags::POSITION_TRACKED;
     }
 
+    let q_b_inv = alvr_hand_core::pose::normalize_quat_or_identity(base.pose.orientation).conjugate();
+    let q_s = alvr_hand_core::pose::normalize_quat_or_identity(space.pose.orientation);
+
     let rel_pose = if pos_valid {
         space.pose.relative_to(base.pose)
     } else if ori_valid {
-        let q_b_inv = base.pose.orientation.normalize().conjugate();
         Pose {
-            orientation: (q_b_inv * space.pose.orientation.normalize()).normalize(),
+            orientation: alvr_hand_core::pose::normalize_quat_or_identity(q_b_inv * q_s),
             position: Vec3::ZERO,
         }
     } else {
@@ -845,13 +1035,14 @@ fn compose_relative(
     let mut angular_velocity = Vec3::ZERO;
 
     if want_vel && ori_valid {
-        let q_b_inv = base.pose.orientation.normalize().conjugate();
         let ang_ok = space
             .velocity_flags
             .contains(xr::SpaceVelocityFlags::ANGULAR_VALID)
             && base
                 .velocity_flags
-                .contains(xr::SpaceVelocityFlags::ANGULAR_VALID);
+                .contains(xr::SpaceVelocityFlags::ANGULAR_VALID)
+            && space.angular_velocity.is_finite()
+            && base.angular_velocity.is_finite();
         if ang_ok {
             let w_rel = q_b_inv * (space.angular_velocity - base.angular_velocity);
             if w_rel.is_finite() {
@@ -868,11 +1059,16 @@ fn compose_relative(
                 .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
             && base
                 .velocity_flags
-                .contains(xr::SpaceVelocityFlags::ANGULAR_VALID);
+                .contains(xr::SpaceVelocityFlags::ANGULAR_VALID)
+            && space.linear_velocity.is_finite()
+            && base.linear_velocity.is_finite()
+            && base.angular_velocity.is_finite();
         if lin_ok {
             let dp = space.pose.position - base.pose.position;
-            let v_rel =
-                q_b_inv * (space.linear_velocity - base.linear_velocity - base.angular_velocity.cross(dp));
+            let v_rel = q_b_inv
+                * (space.linear_velocity
+                    - base.linear_velocity
+                    - base.angular_velocity.cross(dp));
             if v_rel.is_finite() {
                 velocity_flags |= xr::SpaceVelocityFlags::LINEAR_VALID;
                 linear_velocity = v_rel;

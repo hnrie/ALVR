@@ -432,19 +432,27 @@ impl FiniteDiffCache {
 
         let fd_lin = match live_pos {
             Some(p_curr) => {
-                let vel = self.prev_pos.and_then(|(prev_t, p_prev)| {
-                    let dt_ns = i128::from(time_ns) - i128::from(prev_t);
-                    if dt_ns >= i128::from(MIN_VELOCITY_DT_NS)
-                        && dt_ns <= i128::from(MAX_VELOCITY_DT_NS)
-                    {
-                        let dt_s = (dt_ns as f64) * 1e-9;
-                        let lin = ((p_curr - p_prev).as_dvec3() / dt_s).as_vec3();
-                        lin.is_finite().then_some(lin)
-                    } else {
-                        None
+                let (vel, should_store) = match self.prev_pos {
+                    Some((prev_t, p_prev)) => {
+                        let dt_ns = i128::from(time_ns) - i128::from(prev_t);
+                        if dt_ns < 0 {
+                            // Historical/reprojection query: never clobber the newer anchor.
+                            (None, false)
+                        } else if dt_ns >= i128::from(MIN_VELOCITY_DT_NS)
+                            && dt_ns <= i128::from(MAX_VELOCITY_DT_NS)
+                        {
+                            let dt_s = (dt_ns as f64) * 1e-9;
+                            let lin = ((p_curr - p_prev).as_dvec3() / dt_s).as_vec3();
+                            (lin.is_finite().then_some(lin), true)
+                        } else {
+                            (None, dt_ns > 0)
+                        }
                     }
-                });
-                self.prev_pos = Some((time_ns, p_curr));
+                    None => (None, true),
+                };
+                if should_store {
+                    self.prev_pos = Some((time_ns, p_curr));
+                }
                 vel
             }
             None => {
@@ -455,24 +463,32 @@ impl FiniteDiffCache {
 
         let fd_ang = match live_ori {
             Some(q_curr) => {
-                let vel = self.prev_ori.and_then(|(prev_t, q_prev)| {
-                    let dt_ns = i128::from(time_ns) - i128::from(prev_t);
-                    if dt_ns >= i128::from(MIN_VELOCITY_DT_NS)
-                        && dt_ns <= i128::from(MAX_VELOCITY_DT_NS)
-                    {
-                        let dt_s = (dt_ns as f64) * 1e-9;
-                        let mut dq = normalize_quat_or_identity(q_curr * q_prev.conjugate());
-                        if dq.w < 0.0 {
-                            dq = -dq;
+                let (vel, should_store) = match self.prev_ori {
+                    Some((prev_t, q_prev)) => {
+                        let dt_ns = i128::from(time_ns) - i128::from(prev_t);
+                        if dt_ns < 0 {
+                            // Historical/reprojection query: never clobber the newer anchor.
+                            (None, false)
+                        } else if dt_ns >= i128::from(MIN_VELOCITY_DT_NS)
+                            && dt_ns <= i128::from(MAX_VELOCITY_DT_NS)
+                        {
+                            let dt_s = (dt_ns as f64) * 1e-9;
+                            let mut dq = normalize_quat_or_identity(q_curr * q_prev.conjugate());
+                            if dq.w < 0.0 {
+                                dq = -dq;
+                            }
+                            let (axis, angle) = dq.to_axis_angle();
+                            let omega = axis * ((f64::from(angle) / dt_s) as f32);
+                            (omega.is_finite().then_some(omega), true)
+                        } else {
+                            (None, dt_ns > 0)
                         }
-                        let (axis, angle) = dq.to_axis_angle();
-                        let omega = axis * ((f64::from(angle) / dt_s) as f32);
-                        omega.is_finite().then_some(omega)
-                    } else {
-                        None
                     }
-                });
-                self.prev_ori = Some((time_ns, q_curr));
+                    None => (None, true),
+                };
+                if should_store {
+                    self.prev_ori = Some((time_ns, q_curr));
+                }
                 vel
             }
             None => {
@@ -484,6 +500,9 @@ impl FiniteDiffCache {
         (fd_lin, fd_ang)
     }
 }
+
+/// Number of concurrent `baseSpace` coordinate frames cached per hand without heap allocation.
+const MAX_CACHED_BASE_SPACES: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct HandPoseState {
@@ -502,13 +521,79 @@ impl HandPoseState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct BaseSpaceSlot {
+    occupied: bool,
+    base_space_id: u64,
+    last_used_seq: u64,
+    state: HandPoseState,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HandSpaceCache {
+    seq: u64,
+    slots: [BaseSpaceSlot; MAX_CACHED_BASE_SPACES],
+}
+
+impl HandSpaceCache {
+    fn slot_mut(&mut self, base_space_id: u64) -> &mut HandPoseState {
+        self.seq = self.seq.wrapping_add(1);
+        let next_seq = self.seq;
+
+        // 1. Existing matching slot.
+        if let Some(idx) = self
+            .slots
+            .iter()
+            .position(|s| s.occupied && s.base_space_id == base_space_id)
+        {
+            self.slots[idx].last_used_seq = next_seq;
+            return &mut self.slots[idx].state;
+        }
+
+        // 2. First free slot, or least-recently-used slot.
+        let target_idx = self
+            .slots
+            .iter()
+            .position(|s| !s.occupied)
+            .unwrap_or_else(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.last_used_seq)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+
+        let slot = &mut self.slots[target_idx];
+        slot.occupied = true;
+        slot.base_space_id = base_space_id;
+        slot.last_used_seq = next_seq;
+        slot.state.clear();
+        &mut slot.state
+    }
+
+    fn clear_base_space(&mut self, base_space_id: u64) {
+        for slot in &mut self.slots {
+            if slot.occupied && slot.base_space_id == base_space_id {
+                *slot = BaseSpaceSlot::default();
+            }
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.seq = 0;
+        self.slots = [BaseSpaceSlot::default(); MAX_CACHED_BASE_SPACES];
+    }
+}
+
 /// Stateful per-hand controller pose and `baseSpace` velocity synthesizer.
 ///
-/// Holds per-hand `last_palm_pose` fallback state and isolated finite-difference caches for
-/// `/grip/pose`, `/aim/pose`, and `/palm_ext/pose` (`/grip_surface/pose`).
+/// Holds per-hand, per-`baseSpace` `last_palm_pose` fallback state and isolated finite-difference
+/// caches for `/grip/pose`, `/aim/pose`, and `/palm_ext/pose` (`/grip_surface/pose`) so queries in
+/// multiple reference spaces (`LOCAL`, `STAGE`, `VIEW`) never cross-contaminate velocities or poses.
 #[derive(Debug, Clone, Default)]
 pub struct PoseSynthesizer {
-    hands: [HandPoseState; 2],
+    hands: [HandSpaceCache; 2],
 }
 
 impl PoseSynthesizer {
@@ -517,7 +602,7 @@ impl PoseSynthesizer {
         Self::default()
     }
 
-    /// Synthesizes `/input/grip/pose` from the 26-joint hand skeleton (`joints[0]` palm anchor).
+    /// Synthesizes `/input/grip/pose` using the default `baseSpace` cache (`base_space_id = 0`).
     pub fn compute_grip_pose(
         &mut self,
         hand: HandSide,
@@ -525,8 +610,20 @@ impl PoseSynthesizer {
         time_ns: i64,
         cfg: &PoseOffsetConfig,
     ) -> SynthesizedPose {
+        self.compute_grip_pose_in_space(hand, 0, joints, time_ns, cfg)
+    }
+
+    /// Synthesizes `/input/grip/pose` isolated to a specific `base_space_id`.
+    pub fn compute_grip_pose_in_space(
+        &mut self,
+        hand: HandSide,
+        base_space_id: u64,
+        joints: &[HandJointSample; HAND_JOINT_COUNT],
+        time_ns: i64,
+        cfg: &PoseOffsetConfig,
+    ) -> SynthesizedPose {
         let palm_sample = &joints[0];
-        let state = &mut self.hands[hand.index()];
+        let state = self.hands[hand.index()].slot_mut(base_space_id);
         let anchor = state.palm_fallback.resolve_and_update(palm_sample);
         let out_pose = resolve_grip_from_palm(hand, anchor, cfg);
 
@@ -550,8 +647,7 @@ impl PoseSynthesizer {
         }
     }
 
-    /// Synthesizes `/input/aim/pose`, preferring `fb_aim_pose` when `cfg.aim_mode == PreferFbAim`
-    /// and valid, otherwise deriving from synthesized grip pose + grip-to-aim offset.
+    /// Synthesizes `/input/aim/pose` using the default `baseSpace` cache (`base_space_id = 0`).
     pub fn compute_aim_pose(
         &mut self,
         hand: HandSide,
@@ -560,8 +656,23 @@ impl PoseSynthesizer {
         time_ns: i64,
         cfg: &PoseOffsetConfig,
     ) -> SynthesizedPose {
+        self.compute_aim_pose_in_space(hand, 0, joints, fb_aim_pose, time_ns, cfg)
+    }
+
+    /// Synthesizes `/input/aim/pose` isolated to a specific `base_space_id`, preferring
+    /// `fb_aim_pose` when `cfg.aim_mode == PreferFbAim` and valid, otherwise deriving from
+    /// synthesized grip pose + grip-to-aim offset.
+    pub fn compute_aim_pose_in_space(
+        &mut self,
+        hand: HandSide,
+        base_space_id: u64,
+        joints: &[HandJointSample; HAND_JOINT_COUNT],
+        fb_aim_pose: Option<Pose>,
+        time_ns: i64,
+        cfg: &PoseOffsetConfig,
+    ) -> SynthesizedPose {
         let palm_sample = &joints[0];
-        let state = &mut self.hands[hand.index()];
+        let state = self.hands[hand.index()].slot_mut(base_space_id);
         // Always keep palm fallback fresh without mutating `grip_vel`.
         let anchor = state.palm_fallback.resolve_and_update(palm_sample);
 
@@ -635,15 +746,27 @@ impl PoseSynthesizer {
         }
     }
 
-    /// Synthesizes `/input/grip_surface/pose` and `/input/palm_ext/pose` (identical per OpenXR 1.1).
+    /// Synthesizes `/input/grip_surface/pose` and `/input/palm_ext/pose` using the default
+    /// `baseSpace` cache (`base_space_id = 0`).
     pub fn compute_palm_pose(
         &mut self,
         hand: HandSide,
         joints: &[HandJointSample; HAND_JOINT_COUNT],
         time_ns: i64,
     ) -> SynthesizedPose {
+        self.compute_palm_pose_in_space(hand, 0, joints, time_ns)
+    }
+
+    /// Synthesizes `/input/grip_surface/pose` and `/input/palm_ext/pose` isolated to `base_space_id`.
+    pub fn compute_palm_pose_in_space(
+        &mut self,
+        hand: HandSide,
+        base_space_id: u64,
+        joints: &[HandJointSample; HAND_JOINT_COUNT],
+        time_ns: i64,
+    ) -> SynthesizedPose {
         let palm_sample = &joints[0];
-        let state = &mut self.hands[hand.index()];
+        let state = self.hands[hand.index()].slot_mut(base_space_id);
         let anchor = state.palm_fallback.resolve_and_update(palm_sample);
 
         let out_pose = if anchor.orientation_valid {
@@ -698,15 +821,21 @@ impl PoseSynthesizer {
         }
     }
 
+    /// Evicts cached pose fallback & velocity entries for a destroyed `baseSpace` handle.
+    pub fn clear_base_space(&mut self, base_space_id: u64) {
+        self.hands[0].clear_base_space(base_space_id);
+        self.hands[1].clear_base_space(base_space_id);
+    }
+
     /// Clears fallback palm pose and all velocity caches for a single hand.
     pub fn clear_hand(&mut self, hand: HandSide) {
-        self.hands[hand.index()].clear();
+        self.hands[hand.index()].clear_all();
     }
 
     /// Clears fallback palm pose and all velocity caches for both hands.
     pub fn reset(&mut self) {
-        self.hands[0].clear();
-        self.hands[1].clear();
+        self.hands[0].clear_all();
+        self.hands[1].clear_all();
     }
 }
 
@@ -1473,5 +1602,94 @@ mod tests {
             g0.angular_velocity.unwrap(),
             1e-6,
         );
+    }
+
+    #[test]
+    fn multi_base_space_isolation_and_historical_query_preservation() {
+        let cfg = PoseOffsetConfig::default();
+        let mut synth = PoseSynthesizer::new();
+
+        const SPACE_LOCAL: u64 = 100;
+        const SPACE_STAGE: u64 = 200;
+
+        // Frame 0 at t=10ms: LOCAL at (0, 1, 0), STAGE at (5, 0, -3)
+        let t0 = 10_000_000_i64;
+        let j_local_0 = make_joints_with_palm(valid_palm(
+            Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(0.0, 1.0, 0.0),
+            },
+            0.015,
+        ));
+        let j_stage_0 = make_joints_with_palm(valid_palm(
+            Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(5.0, 0.0, -3.0),
+            },
+            0.015,
+        ));
+        let g_l0 = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_LOCAL, &j_local_0, t0, &cfg);
+        let g_s0 = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_STAGE, &j_stage_0, t0, &cfg);
+        assert!(g_l0.linear_velocity.is_none());
+        assert!(g_s0.linear_velocity.is_none());
+
+        // Frame 1 at t=20ms (dt=10ms): LOCAL moved +0.01m X (+1 m/s), STAGE moved +0.02m Y (+2 m/s).
+        // Alternating spaces must NOT produce cross-space 500 m/s velocity spikes!
+        let t1 = 20_000_000_i64;
+        let j_local_1 = make_joints_with_palm(valid_palm(
+            Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(0.01, 1.0, 0.0),
+            },
+            0.015,
+        ));
+        let j_stage_1 = make_joints_with_palm(valid_palm(
+            Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(5.0, 0.02, -3.0),
+            },
+            0.015,
+        ));
+        let g_l1 = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_LOCAL, &j_local_1, t1, &cfg);
+        let g_s1 = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_STAGE, &j_stage_1, t1, &cfg);
+        assert_vec3_near(g_l1.linear_velocity.expect("local vel"), Vec3::new(1.0, 0.0, 0.0), 1e-4);
+        assert_vec3_near(g_s1.linear_velocity.expect("stage vel"), Vec3::new(0.0, 2.0, 0.0), 1e-4);
+
+        // Historical reprojection query at t1 - 5ms returns None WITHOUT overwriting t1 anchor!
+        let j_hist = make_joints_with_palm(valid_palm(
+            Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(99.0, 99.0, 99.0),
+            },
+            0.015,
+        ));
+        let g_hist = synth.compute_grip_pose_in_space(
+            HandSide::Left,
+            SPACE_LOCAL,
+            &j_hist,
+            t1 - 5_000_000,
+            &cfg,
+        );
+        assert!(g_hist.linear_velocity.is_none());
+
+        // Frame 2 at t=30ms: LOCAL moved another +0.01m X -> STILL computes exact +1.0 m/s!
+        let t2 = 30_000_000_i64;
+        let j_local_2 = make_joints_with_palm(valid_palm(
+            Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(0.02, 1.0, 0.0),
+            },
+            0.015,
+        ));
+        let g_l2 = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_LOCAL, &j_local_2, t2, &cfg);
+        assert_vec3_near(g_l2.linear_velocity.expect("local vel after hist"), Vec3::new(1.0, 0.0, 0.0), 1e-4);
+
+        // Fallback isolation: clearing SPACE_LOCAL does not lose SPACE_STAGE fallback
+        synth.clear_base_space(SPACE_LOCAL);
+        let invalid = make_joints_with_palm(HandJointSample::default());
+        let l_after = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_LOCAL, &invalid, t2 + 10_000_000, &cfg);
+        let s_after = synth.compute_grip_pose_in_space(HandSide::Left, SPACE_STAGE, &invalid, t2 + 10_000_000, &cfg);
+        assert!(!l_after.position_valid);
+        assert!(s_after.position_valid && !s_after.position_tracked);
     }
 }

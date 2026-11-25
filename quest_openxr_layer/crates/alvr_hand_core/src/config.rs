@@ -332,21 +332,21 @@ impl LayerConfig {
 
     /// Load config checking `ALVR_HAND_LAYER_CONFIG` first, then `candidate_paths` in order.
     ///
-    /// Always returns a valid, sanitized [`LayerConfig`] and never panics.
-    pub fn load_from_paths<P: AsRef<Path>>(candidate_paths: &[P]) -> Self {
+    /// Returns `None` if neither the env override nor any candidate path yielded a valid config.
+    pub fn try_load_from_paths<P: AsRef<Path>>(candidate_paths: &[P]) -> Option<Self> {
         let env_path = std::env::var_os(CONFIG_ENV_VAR).filter(|v| !v.is_empty());
         let env_ref = env_path.as_deref().map(Path::new);
-        Self::load_from_paths_with_env(env_ref, candidate_paths)
+        Self::try_load_from_paths_with_env(env_ref, candidate_paths)
     }
 
-    /// Race-free testable loader accepting an explicit environment-override path.
-    pub fn load_from_paths_with_env<P: AsRef<Path>>(
+    /// Race-free testable loader returning `None` when no file could be loaded.
+    pub fn try_load_from_paths_with_env<P: AsRef<Path>>(
         env_override: Option<&Path>,
         candidate_paths: &[P],
-    ) -> Self {
+    ) -> Option<Self> {
         if let Some(path) = env_override.filter(|p| !p.as_os_str().is_empty()) {
             match Self::load_from_file(path) {
-                Ok(cfg) => return cfg,
+                Ok(cfg) => return Some(cfg),
                 Err(err) => {
                     log::warn!(
                         "Failed to load config from {} ({}): {}; trying fallback paths",
@@ -364,7 +364,7 @@ impl LayerConfig {
                 continue;
             }
             match Self::load_from_file(path) {
-                Ok(cfg) => return cfg,
+                Ok(cfg) => return Some(cfg),
                 Err(ConfigError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                     log::debug!("Config file not found at {}", path.display());
                 }
@@ -378,7 +378,23 @@ impl LayerConfig {
             }
         }
 
-        Self::default().sanitized()
+        None
+    }
+
+    /// Load config checking `ALVR_HAND_LAYER_CONFIG` first, then `candidate_paths` in order.
+    ///
+    /// Always returns a valid, sanitized [`LayerConfig`] and never panics.
+    pub fn load_from_paths<P: AsRef<Path>>(candidate_paths: &[P]) -> Self {
+        Self::try_load_from_paths(candidate_paths).unwrap_or_else(|| Self::default().sanitized())
+    }
+
+    /// Race-free testable loader accepting an explicit environment-override path.
+    pub fn load_from_paths_with_env<P: AsRef<Path>>(
+        env_override: Option<&Path>,
+        candidate_paths: &[P],
+    ) -> Self {
+        Self::try_load_from_paths_with_env(env_override, candidate_paths)
+            .unwrap_or_else(|| Self::default().sanitized())
     }
 }
 

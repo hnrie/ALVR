@@ -118,9 +118,25 @@ pub unsafe extern "system" fn layer_destroy_action_set(action_set: xr::ActionSet
                     actions_map.remove(a);
                 }
             }
-            let mut inst_inner = meta.instance.inner.write();
-            inst_inner.action_sets.retain(|&s| s != raw);
-            inst_inner.actions.retain(|a| !child_actions.contains(a));
+            let session_ids: Vec<u64> = {
+                let mut inst_inner = meta.instance.inner.write();
+                inst_inner.action_sets.retain(|&s| s != raw);
+                inst_inner.actions.retain(|a| !child_actions.contains(a));
+                for &a in &child_actions {
+                    inst_inner.remove_action_bindings(a);
+                }
+                inst_inner.sessions.clone()
+            };
+            for sid in session_ids {
+                if let Some(sess) = get_session(xr::Session::from_raw(sid)) {
+                    let mut sinner = sess.inner.lock();
+                    sinner.attached_action_sets.remove(&raw);
+                    sinner.active_synced_sets.remove(&raw);
+                    for &a in &child_actions {
+                        sinner.prune_action_state(a);
+                    }
+                }
+            }
         }
         res
     })
@@ -178,7 +194,17 @@ pub unsafe extern "system" fn layer_destroy_action(action: xr::Action) -> xr::Re
             if let Some(set_meta) = ACTION_SETS.read().get(&meta.action_set).cloned() {
                 set_meta.actions.write().retain(|&a| a != raw);
             }
-            meta.instance.inner.write().actions.retain(|&a| a != raw);
+            let session_ids: Vec<u64> = {
+                let mut inst_inner = meta.instance.inner.write();
+                inst_inner.actions.retain(|&a| a != raw);
+                inst_inner.remove_action_bindings(raw);
+                inst_inner.sessions.clone()
+            };
+            for sid in session_ids {
+                if let Some(sess) = get_session(xr::Session::from_raw(sid)) {
+                    sess.inner.lock().prune_action_state(raw);
+                }
+            }
         }
         res
     })
@@ -225,8 +251,7 @@ pub unsafe extern "system" fn layer_suggest_interaction_profile_bindings(
         // OpenXR spec (`input.adoc:566-569`): repeat suggestion for same profile REPLACES prior bindings.
         inst.inner
             .write()
-            .suggested_bindings
-            .insert(sb.interaction_profile.into_raw(), entries);
+            .set_suggested_bindings(sb.interaction_profile.into_raw(), entries);
 
         xr::Result::SUCCESS
     })
@@ -312,8 +337,10 @@ pub unsafe extern "system" fn layer_sync_actions(
         if res == xr::Result::SESSION_NOT_FOCUSED {
             let mut inner = sess.inner.lock();
             inner.last_sync_focused = false;
+            inner.sync_reported_unfocused = true;
             inner.active_synced_sets.clear();
             inner.action_snapshots.clear();
+            inner.sticky_pose_source.clear();
             inner.gesture_engine.reset();
             inner.last_hand_states = [VirtualHandState::default(); 2];
             for prev in inner.prev_action_values.values_mut() {
@@ -362,8 +389,10 @@ pub unsafe extern "system" fn layer_sync_actions(
         if !inst.emulation_enabled() || !trackers_available {
             let mut inner = sess.inner.lock();
             inner.last_sync_focused = true;
+            inner.sync_reported_unfocused = false;
             inner.active_synced_sets = active_sets;
             inner.action_snapshots.clear();
+            inner.sticky_pose_source.clear();
             for arb in &mut inner.hand_arb {
                 arb.emulated = false;
                 arb.hand_tracked = false;
@@ -389,13 +418,15 @@ pub unsafe extern "system" fn layer_sync_actions(
             }
         }
 
-        // Collect all actions in active_sets.
+        // Collect all actions in active_sets along with each action set's OpenXR priority.
         let mut active_actions: Vec<Arc<ActionMeta>> = Vec::new();
+        let mut set_priorities: HashMap<u64, u32> = HashMap::new();
         {
             let sets_map = ACTION_SETS.read();
             let actions_map = ACTIONS.read();
             for &set_raw in active_sets.keys() {
                 if let Some(set_meta) = sets_map.get(&set_raw) {
+                    set_priorities.insert(set_raw, set_meta.priority);
                     for &act_raw in set_meta.actions.read().iter() {
                         if let Some(act_meta) = actions_map.get(&act_raw) {
                             active_actions.push(Arc::clone(act_meta));
@@ -407,7 +438,7 @@ pub unsafe extern "system" fn layer_sync_actions(
 
         // Probe downstream physical action states for every active (action, subaction_path)
         // WITHOUT holding any lock. This both detects physical controller presence AND supplies
-        // physical samples for mixed-hand aggregation!
+        // physical samples for mixed-hand / non-hand aggregation!
         let mut phys_samples: HashMap<(u64, u64), PhysicalActionSample> = HashMap::new();
         let mut observed_xr_time: i64 = 0;
         for act in &active_actions {
@@ -429,9 +460,11 @@ pub unsafe extern "system" fn layer_sync_actions(
             }
         }
 
-        // Determine per-hand physical activity using BOTH probed action activity and runtime profiles.
-        let mut hand_has_any_bound_action = [false; 2];
+        // Determine per-hand physical activity using O(1) indexed bindings + probed action activity.
+        let mut hand_has_direct_bound_action = [false; 2];
         let mut hand_physical_action_active = [false; 2];
+        let mut hand_has_shared_bound_action = [false; 2];
+        let mut hand_shared_any_active = [false; 2];
 
         {
             let inst_inner = inst.inner.read();
@@ -441,26 +474,26 @@ pub unsafe extern "system" fn layer_sync_actions(
                 }
                 let act_raw = act.handle.into_raw();
                 for hand in [HandSide::Left, HandSide::Right] {
+                    let h_idx = hand.index();
                     let hand_path_raw = inst.hand_user_path(hand).into_raw();
-                    // Check if this action has bindings on `hand` under the runtime profile OR preferred profile.
                     let mut bound_to_hand = false;
                     let mut bound_only_to_this_hand = false;
                     let check_profiles = [
-                        runtime_profiles[hand.index()],
+                        runtime_profiles[h_idx],
                         preferred_profile.map(|(p, _)| p).unwrap_or(0),
                     ];
                     for &prof_raw in &check_profiles {
                         if prof_raw == 0 {
                             continue;
                         }
-                        if let Some(entries) = inst_inner.suggested_bindings.get(&prof_raw) {
+                        if let Some(binding_paths) = inst_inner
+                            .bindings_by_profile_action
+                            .get(&(prof_raw, act_raw))
+                        {
                             let mut has_this = false;
                             let mut has_other = false;
-                            for e in entries {
-                                if e.action != act_raw {
-                                    continue;
-                                }
-                                if let Some(pstr) = inst_inner.path_str(e.binding_path) {
+                            for &bp in binding_paths {
+                                if let Some(pstr) = inst_inner.path_str(bp) {
                                     if pstr.starts_with(hand.user_path()) {
                                         has_this = true;
                                     } else if pstr.starts_with("/user/hand/") {
@@ -481,23 +514,30 @@ pub unsafe extern "system" fn layer_sync_actions(
                         continue;
                     }
 
-                    // Only count this action as distinguishable for `hand` if it splits by subaction
-                    // OR binds exclusively to `hand`; otherwise fall back to `runtime_profiles[hand]`.
                     if act.subaction_paths.contains(&hand_path_raw) {
-                        hand_has_any_bound_action[hand.index()] = true;
+                        hand_has_direct_bound_action[h_idx] = true;
                         if phys_samples
                             .get(&(act_raw, hand_path_raw))
                             .is_some_and(|s| s.is_active)
                         {
-                            hand_physical_action_active[hand.index()] = true;
+                            hand_physical_action_active[h_idx] = true;
                         }
                     } else if bound_only_to_this_hand {
-                        hand_has_any_bound_action[hand.index()] = true;
+                        hand_has_direct_bound_action[h_idx] = true;
                         if phys_samples
                             .get(&(act_raw, 0))
                             .is_some_and(|s| s.is_active)
                         {
-                            hand_physical_action_active[hand.index()] = true;
+                            hand_physical_action_active[h_idx] = true;
+                        }
+                    } else {
+                        // Shared action bound to BOTH hands with no subaction paths.
+                        hand_has_shared_bound_action[h_idx] = true;
+                        if phys_samples
+                            .get(&(act_raw, 0))
+                            .is_some_and(|s| s.is_active)
+                        {
+                            hand_shared_any_active[h_idx] = true;
                         }
                     }
                 }
@@ -509,12 +549,21 @@ pub unsafe extern "system" fn layer_sync_actions(
             let idx = hand.index();
             physical_active[idx] = if hand_physical_action_active[idx] {
                 true
-            } else if !hand_has_any_bound_action[idx] {
+            } else if hand_has_direct_bound_action[idx] {
+                // Direct actions for this hand WERE synced and ALL returned isActive == FALSE.
+                false
+            } else if hand_has_shared_bound_action[idx] {
+                // Only shared actions bound to both hands exist:
+                // - If ALL shared actions returned isActive == FALSE, physical controller is definitely inactive
+                //   (even if Quest kept a dormant runtime interaction profile path!).
+                // - If a shared action returned isActive == TRUE, trust runtime_profiles[idx] != 0
+                //   (or both hands if runtime reported no profile).
+                hand_shared_any_active[idx]
+                    && (runtime_profiles[idx] != 0
+                        || (runtime_profiles[0] == 0 && runtime_profiles[1] == 0))
+            } else {
                 // No actions bound to this hand were synced; trust runtime's active interaction profile.
                 runtime_profiles[idx] != 0
-            } else {
-                // Actions bound to this hand WERE synced and ALL returned isActive == FALSE.
-                false
             };
         }
 
@@ -550,7 +599,7 @@ pub unsafe extern "system" fn layer_sync_actions(
         let resolved_by_action: HashMap<u64, Vec<crate::profiles::BoundSource>> =
             if let Some((prof_raw, prof)) = preferred_profile {
                 let inst_inner = inst.inner.read();
-                let mut map = HashMap::new();
+                let mut map = HashMap::with_capacity(active_actions.len());
                 for act in &active_actions {
                     let act_raw = act.handle.into_raw();
                     let sources = resolve_action_sources(&inst_inner, act_raw, prof_raw, prof, None);
@@ -564,10 +613,41 @@ pub unsafe extern "system" fn layer_sync_actions(
         let left_path_raw = inst.left_hand_path.into_raw();
         let right_path_raw = inst.right_hand_path.into_raw();
 
+        // Compute OpenXR Action Set Priority winners per `(HandSide, binding_path_raw)`.
+        // When two active action sets bind the same input source on an active hand, only the
+        // highest-priority active action set(s) receive input from that source (`input.adoc`).
+        let mut winning_source_priority: HashMap<(HandSide, u64), u32> = HashMap::new();
+        for act in &active_actions {
+            if act.action_type == xr::ActionType::VIBRATION_OUTPUT {
+                continue;
+            }
+            let act_prio = set_priorities.get(&act.action_set).copied().unwrap_or(0);
+            let eligible = eligible_hands_for_query(
+                &active_sets,
+                act.action_set,
+                0,
+                left_path_raw,
+                right_path_raw,
+            );
+            if let Some(sources) = resolved_by_action.get(&act.handle.into_raw()) {
+                for src in sources {
+                    if !eligible[src.resolved.hand.index()] {
+                        continue;
+                    }
+                    let key = (src.resolved.hand, src.binding_path_raw);
+                    winning_source_priority
+                        .entry(key)
+                        .and_modify(|p| *p = (*p).max(act_prio))
+                        .or_insert(act_prio);
+                }
+            }
+        }
+
         // Update session state, arbitration, gesture engine, and freeze atomic action snapshots!
         let queue_profile_changed = {
             let mut inner = sess.inner.lock();
             inner.last_sync_focused = true;
+            inner.sync_reported_unfocused = false;
             inner.active_synced_sets = active_sets.clone();
 
             let mut profile_changed = false;
@@ -594,9 +674,9 @@ pub unsafe extern "system" fn layer_sync_actions(
                     };
                     if grace_elapsed {
                         inner.hand_arb[idx].emulated = true;
-                        let st = inner.gesture_engine.update_hand(
+                        let st = inner.gesture_engine.update_hand_samples(
                             hand,
-                            &hand_data.poses,
+                            &hand_data.samples,
                             now_ms,
                             &inst.config,
                         );
@@ -637,6 +717,7 @@ pub unsafe extern "system" fn layer_sync_actions(
                     continue;
                 }
                 let act_raw = act.handle.into_raw();
+                let act_prio = set_priorities.get(&act.action_set).copied().unwrap_or(0);
                 let sources = resolved_by_action
                     .get(&act_raw)
                     .map(Vec::as_slice)
@@ -659,8 +740,10 @@ pub unsafe extern "system" fn layer_sync_actions(
                     let mut snap = compute_action_snapshot(
                         &mut inner,
                         act,
+                        act_prio,
                         sub_raw,
                         sources,
+                        &winning_source_priority,
                         eligible_hands,
                         emulated_flags,
                         &hand_states,
@@ -670,6 +753,7 @@ pub unsafe extern "system" fn layer_sync_actions(
                         &inst.config,
                         xr_time_ns,
                     );
+                    snap.value = snap.value.sanitize();
 
                     // Update prev_action_values for exact changedSinceLastSync tracking.
                     let key = (act_raw, sub_raw);
@@ -686,11 +770,7 @@ pub unsafe extern "system" fn layer_sync_actions(
                                 let changed = snap.value != prev.value;
                                 snap.changed_since_last_sync = changed;
                                 snap.last_change_time = if changed {
-                                    if snap.last_change_time > 0 {
-                                        snap.last_change_time
-                                    } else {
-                                        xr_time_ns
-                                    }
+                                    snap.last_change_time.max(xr_time_ns).max(prev.last_change_time)
                                 } else {
                                     prev.last_change_time
                                 };
@@ -723,13 +803,17 @@ pub unsafe extern "system" fn layer_sync_actions(
                     prev.was_active = false;
                 }
             }
+            // Drop stale sticky pose entries for actions not synced this frame.
+            inner
+                .sticky_pose_source
+                .retain(|k, _| synced_keys.contains(k));
 
             inner.action_snapshots = new_snapshots;
             profile_changed
         };
 
         if queue_profile_changed {
-            inst.inner.write().pending_events.push_back(session);
+            inst.inner.write().queue_profile_changed(session);
         }
 
         xr::Result::SUCCESS
@@ -986,8 +1070,8 @@ pub unsafe extern "system" fn layer_enumerate_bound_sources_for_action(
             );
         }
 
-        // Collect downstream sources (for any physical hand) first.
-        let mut merged: Vec<xr::Path> = Vec::new();
+        // Collect downstream sources for non-emulated hands and non-hand devices first.
+        let mut rt_raw_sources: Vec<xr::Path> = Vec::new();
         let mut rt_count = 0u32;
         if (sess.instance.next.enumerate_bound_sources_for_action)(
             session,
@@ -1009,16 +1093,30 @@ pub unsafe extern "system" fn layer_enumerate_bound_sources_for_action(
             ) == xr::Result::SUCCESS
             {
                 for p in buf.into_iter().take(written as usize) {
-                    if p != xr::Path::NULL && !merged.contains(&p) {
-                        merged.push(p);
+                    if p != xr::Path::NULL {
+                        ensure_path_cached(&sess.instance, p);
+                        rt_raw_sources.push(p);
                     }
                 }
             }
         }
 
-        // Append emulated binding paths for emulated hands.
+        let mut merged: Vec<xr::Path> = Vec::new();
         {
             let inst_inner = sess.instance.inner.read();
+            for p in rt_raw_sources {
+                // Exclude stale downstream paths for hands currently owned by emulation
+                // (prevents duplicate bindings when Quest retains a dormant controller profile).
+                let belongs_to_emulated_hand = inst_inner.path_str(p.into_raw()).is_some_and(|s| {
+                    (emulated_hands[0] && s.starts_with("/user/hand/left/"))
+                        || (emulated_hands[1] && s.starts_with("/user/hand/right/"))
+                });
+                if !belongs_to_emulated_hand && !merged.contains(&p) {
+                    merged.push(p);
+                }
+            }
+
+            // Append emulated binding paths for emulated hands.
             for hand in [HandSide::Left, HandSide::Right] {
                 if !emulated_hands[hand.index()] {
                     continue;
@@ -1081,11 +1179,11 @@ pub unsafe extern "system" fn layer_get_input_source_localized_name(
             return xr::Result::ERROR_VALIDATION_FAILURE;
         }
 
-        let (attached, emulated_any, effective_profiles) = {
+        let (attached, emulated_hands, effective_profiles) = {
             let inner = sess.inner.lock();
             (
                 inner.attached,
-                inner.any_hand_emulated(),
+                [inner.hand_arb[0].emulated, inner.hand_arb[1].emulated],
                 [
                     inner.hand_arb[0].effective_profile,
                     inner.hand_arb[1].effective_profile,
@@ -1096,7 +1194,7 @@ pub unsafe extern "system" fn layer_get_input_source_localized_name(
             return xr::Result::ERROR_ACTIONSET_NOT_ATTACHED;
         }
 
-        if !emulated_any {
+        if !emulated_hands[0] && !emulated_hands[1] {
             return (sess.instance.next.get_input_source_localized_name)(
                 session,
                 get_info,
@@ -1106,20 +1204,33 @@ pub unsafe extern "system" fn layer_get_input_source_localized_name(
             );
         }
 
-        // Determine matching emulated profile for this source_path.
+        ensure_path_cached(&sess.instance, info.source_path);
+
+        // Identify the specific hand for `info.source_path`:
+        // Only intercept if THAT specific hand is currently emulated; physical/non-hand paths pass through!
         let profile = {
             let inst_inner = sess.instance.inner.read();
-            let mut found = None;
-            for prof_raw in effective_profiles {
-                if let Some(p) = inst_inner
-                    .path_str(prof_raw)
-                    .and_then(InteractionProfile::from_path)
-                {
-                    found = Some(p);
-                    break;
+            let source_hand = inst_inner
+                .path_str(info.source_path.into_raw())
+                .and_then(|s| {
+                    if s.starts_with("/user/hand/left/") {
+                        Some(HandSide::Left)
+                    } else if s.starts_with("/user/hand/right/") {
+                        Some(HandSide::Right)
+                    } else {
+                        None
+                    }
+                });
+            match source_hand {
+                Some(hand) if emulated_hands[hand.index()] => {
+                    let prof_raw = effective_profiles[hand.index()];
+                    inst_inner
+                        .path_str(prof_raw)
+                        .and_then(InteractionProfile::from_path)
+                        .or_else(|| select_emulated_profile(&inst_inner).map(|(_, p)| p))
                 }
+                _ => None,
             }
-            found.or_else(|| select_emulated_profile(&inst_inner).map(|(_, p)| p))
         };
 
         if let Some(prof) = profile {
@@ -1294,7 +1405,8 @@ fn validate_haptic_query(
 
 fn haptic_target_mode(sess: &SessionState, subaction_path: xr::Path) -> (bool, bool, bool) {
     let inner = sess.inner.lock();
-    let focused = inner.session_state == xr::SessionState::FOCUSED || inner.last_sync_focused;
+    let focused = !inner.sync_reported_unfocused
+        && (inner.last_sync_focused || inner.session_state == xr::SessionState::FOCUSED);
     let (em_l, em_r) = (inner.hand_arb[0].emulated, inner.hand_arb[1].emulated);
     drop(inner);
 
@@ -1305,7 +1417,7 @@ fn haptic_target_mode(sess: &SessionState, subaction_path: xr::Path) -> (bool, b
     }
 }
 
-fn is_subaction_synced(
+pub(crate) fn is_subaction_synced(
     active_sets: &HashMap<u64, HashSet<u64>>,
     action_set_raw: u64,
     subaction_raw: u64,
@@ -1425,8 +1537,10 @@ unsafe fn probe_physical_action(
 fn compute_action_snapshot(
     inner: &mut crate::state::SessionInner,
     act: &ActionMeta,
+    act_priority: u32,
     sub_raw: u64,
     sources: &[crate::profiles::BoundSource],
+    winning_source_priority: &HashMap<(HandSide, u64), u32>,
     eligible_hands: [bool; 2],
     emulated_flags: [bool; 2],
     hand_states: &[VirtualHandState; 2],
@@ -1438,10 +1552,19 @@ fn compute_action_snapshot(
 ) -> ActionSnapshot {
     let act_raw = act.handle.into_raw();
 
-    // Check if ALL eligible hands are non-emulated -> pure physical sample passthrough.
-    let any_eligible_emulated =
-        (eligible_hands[0] && emulated_flags[0]) || (eligible_hands[1] && emulated_flags[1]);
-    if !any_eligible_emulated {
+    // Check if this action actually binds to ANY currently-emulated eligible hand!
+    // If NOT (e.g., `/user/head/...`, `/user/gamepad/...`, `/user/eyes_ext/...`, or a hand
+    // currently driven by a physical controller), pass through downstream `phys_samples` cleanly
+    // so non-hand actions keep working even when BOTH hands are emulated!
+    let has_any_emulated_binding = sources.iter().any(|src| {
+        let h_idx = src.resolved.hand.index();
+        eligible_hands[h_idx] && emulated_flags[h_idx]
+    });
+
+    if !has_any_emulated_binding {
+        if act.action_type == xr::ActionType::POSE_INPUT {
+            inner.sticky_pose_source.remove(&(act_raw, sub_raw));
+        }
         if let Some(p) = phys_samples.get(&(act_raw, sub_raw)) {
             return ActionSnapshot {
                 is_active: p.is_active,
@@ -1457,6 +1580,14 @@ fn compute_action_snapshot(
             last_change_time: 0,
         };
     }
+
+    let source_allowed_by_priority = |src: &crate::profiles::BoundSource| -> bool {
+        let win = winning_source_priority
+            .get(&(src.resolved.hand, src.binding_path_raw))
+            .copied()
+            .unwrap_or(act_priority);
+        act_priority >= win
+    };
 
     match act.action_type {
         xr::ActionType::BOOLEAN_INPUT => {
@@ -1479,17 +1610,22 @@ fn compute_action_snapshot(
                         if p.is_active {
                             if let SnapshotValue::Bool(b) = p.value {
                                 vals.push(b);
-                                last_time = last_time.max(p.last_change_time);
+                                if p.changed_since_last_sync {
+                                    last_time = last_time.max(p.last_change_time);
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Collect emulated contributions from emulated eligible hands.
+            // Collect emulated contributions from emulated eligible hands (honoring Action Set Priority).
             for (src_idx, src) in sources.iter().enumerate() {
                 let h_idx = src.resolved.hand.index();
-                if !eligible_hands[h_idx] || !emulated_flags[h_idx] {
+                if !eligible_hands[h_idx]
+                    || !emulated_flags[h_idx]
+                    || !source_allowed_by_priority(src)
+                {
                     continue;
                 }
                 let hyst = inner
@@ -1541,7 +1677,9 @@ fn compute_action_snapshot(
                         if p.is_active {
                             if let SnapshotValue::Float(f) = p.value {
                                 vals.push(f);
-                                last_time = last_time.max(p.last_change_time);
+                                if p.changed_since_last_sync {
+                                    last_time = last_time.max(p.last_change_time);
+                                }
                             }
                         }
                     }
@@ -1550,7 +1688,10 @@ fn compute_action_snapshot(
 
             for src in sources {
                 let h_idx = src.resolved.hand.index();
-                if !eligible_hands[h_idx] || !emulated_flags[h_idx] {
+                if !eligible_hands[h_idx]
+                    || !emulated_flags[h_idx]
+                    || !source_allowed_by_priority(src)
+                {
                     continue;
                 }
                 if let Some(f) = src.resolved.evaluate_float(&hand_states[h_idx]) {
@@ -1593,7 +1734,9 @@ fn compute_action_snapshot(
                         if p.is_active {
                             if let SnapshotValue::Vec2(v) = p.value {
                                 vals.push(v);
-                                last_time = last_time.max(p.last_change_time);
+                                if p.changed_since_last_sync {
+                                    last_time = last_time.max(p.last_change_time);
+                                }
                             }
                         }
                     }
@@ -1602,7 +1745,10 @@ fn compute_action_snapshot(
 
             for src in sources {
                 let h_idx = src.resolved.hand.index();
-                if !eligible_hands[h_idx] || !emulated_flags[h_idx] {
+                if !eligible_hands[h_idx]
+                    || !emulated_flags[h_idx]
+                    || !source_allowed_by_priority(src)
+                {
                     continue;
                 }
                 if let Some(v) = src.resolved.evaluate_vec2(&hand_states[h_idx]) {
@@ -1631,7 +1777,10 @@ fn compute_action_snapshot(
             for src in sources {
                 let hand = src.resolved.hand;
                 let h_idx = hand.index();
-                if !eligible_hands[h_idx] || !emulated_flags[h_idx] {
+                if !eligible_hands[h_idx]
+                    || !emulated_flags[h_idx]
+                    || !source_allowed_by_priority(src)
+                {
                     continue;
                 }
                 if let Some(pose_src) = src.resolved.pose_source() {

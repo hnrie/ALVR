@@ -1,7 +1,7 @@
 //! OpenXR API Layer negotiation, `xrCreateApiLayerInstance`, `xrGetInstanceProcAddr` distributed
 //! dispatch, and instance/session/event lifecycle hooks.
 
-use crate::android::{android_config_candidates, init_logging};
+use crate::android::{android_asset_config, android_config_candidates, init_logging};
 use crate::input;
 use crate::spaces;
 use crate::state::{
@@ -10,6 +10,7 @@ use crate::state::{
     EXT_KHR_LOCATE_SPACES, INSTANCES, LAYER_NAME, SESSIONS, SPACES,
 };
 use alvr_hand_core::config::{LayerConfig, DISABLE_ENV_VAR};
+use alvr_hand_core::VirtualHandState;
 use openxr_sys as xr;
 use openxr_sys::Handle;
 use parking_lot::{Mutex, RwLock};
@@ -167,7 +168,8 @@ pub unsafe extern "system" fn layer_create_api_layer_instance(
         let app_enabled_fb_aim = orig_exts.iter().any(|e| e == EXT_FB_HAND_TRACKING_AIM);
         let app_enabled_locate_spaces_khr = orig_exts.iter().any(|e| e == EXT_KHR_LOCATE_SPACES);
 
-        // Load runtime configuration (ALVR_HAND_LAYER_CONFIG > Android externalFilesDir > settings_file_location > defaults).
+        // Load runtime configuration:
+        // ALVR_HAND_LAYER_CONFIG > Android externalFilesDir > filesDir > settings_file_location > APK asset > defaults.
         let disabled_by_env = std::env::var_os(DISABLE_ENV_VAR).is_some_and(|v| !v.is_empty());
         let mut candidates: Vec<PathBuf> = android_config_candidates();
         if li.settings_file_location[0] != 0 {
@@ -177,7 +179,9 @@ pub unsafe extern "system" fn layer_create_api_layer_instance(
                 }
             }
         }
-        let config = LayerConfig::load_from_paths(&candidates);
+        let config = LayerConfig::try_load_from_paths(&candidates)
+            .or_else(android_asset_config)
+            .unwrap_or_else(|| LayerConfig::default().sanitized());
 
         // Inject XR_EXT_hand_tracking + optional XR_FB_hand_tracking_aim with progressive fallback.
         let mut layer_has_hand_tracking = app_enabled_hand_tracking;
@@ -242,8 +246,14 @@ pub unsafe extern "system" fn layer_create_api_layer_instance(
 
         let created_instance = *instance;
 
-        // Populate downstream dispatch table.
+        // Populate downstream dispatch table; destroy created_instance on failure so nothing leaks!
         let Some(next_dispatch) = build_next_dispatch(next_gipa, created_instance) else {
+            if let Some(destroy_fn) =
+                load_pfn::<xr::pfn::DestroyInstance>(next_gipa, created_instance, b"xrDestroyInstance\0")
+            {
+                let _ = destroy_fn(created_instance);
+            }
+            *instance = xr::Instance::NULL;
             return xr::Result::ERROR_INITIALIZATION_FAILED;
         };
 
@@ -314,6 +324,13 @@ pub unsafe extern "system" fn layer_get_instance_proc_addr(
                     >(crate::xrInitializeLoaderKHR));
                     xr::Result::SUCCESS
                 }
+                "xrGetInstanceProcAddr" => {
+                    *function = Some(transmute::<
+                        xr::pfn::GetInstanceProcAddr,
+                        xr::pfn::VoidFunction,
+                    >(layer_get_instance_proc_addr));
+                    xr::Result::SUCCESS
+                }
                 "xrEnumerateApiLayerProperties"
                 | "xrEnumerateInstanceExtensionProperties"
                 | "xrCreateInstance" => xr::Result::ERROR_FUNCTION_UNSUPPORTED,
@@ -331,6 +348,22 @@ pub unsafe extern "system" fn layer_get_instance_proc_addr(
                 fn_name,
                 "xrCreateHandTrackerEXT" | "xrDestroyHandTrackerEXT" | "xrLocateHandJointsEXT"
             )
+        {
+            *function = None;
+            return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
+        }
+
+        // Gate OpenXR 1.1 `xrLocateSpaces` and extension `xrLocateSpacesKHR` strictly so apps
+        // cannot bypass our space hook when running on an OpenXR 1.1 runtime under an OpenXR 1.0 instance.
+        if fn_name == "xrLocateSpaces"
+            && ((inst.app_api_version.major(), inst.app_api_version.minor()) < (1, 1)
+                || inst.next.locate_spaces.is_none())
+        {
+            *function = None;
+            return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
+        }
+        if fn_name == "xrLocateSpacesKHR"
+            && (!inst.app_enabled_locate_spaces_khr || inst.next.locate_spaces_khr.is_none())
         {
             *function = None;
             return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
@@ -392,22 +425,13 @@ pub unsafe extern "system" fn layer_get_instance_proc_addr(
             "xrLocateSpace" => Some(transmute::<xr::pfn::LocateSpace, xr::pfn::VoidFunction>(
                 spaces::layer_locate_space,
             )),
-            "xrLocateSpaces"
-                if (inst.app_api_version.major(), inst.app_api_version.minor()) >= (1, 1)
-                    && inst.next.locate_spaces.is_some() =>
-            {
-                Some(transmute::<xr::pfn::LocateSpaces, xr::pfn::VoidFunction>(
-                    spaces::layer_locate_spaces,
-                ))
-            }
-            "xrLocateSpacesKHR"
-                if inst.app_enabled_locate_spaces_khr && inst.next.locate_spaces_khr.is_some() =>
-            {
-                Some(transmute::<
-                    xr::pfn::LocateSpacesKHR,
-                    xr::pfn::VoidFunction,
-                >(spaces::layer_locate_spaces_khr))
-            }
+            "xrLocateSpaces" => Some(transmute::<xr::pfn::LocateSpaces, xr::pfn::VoidFunction>(
+                spaces::layer_locate_spaces,
+            )),
+            "xrLocateSpacesKHR" => Some(transmute::<
+                xr::pfn::LocateSpacesKHR,
+                xr::pfn::VoidFunction,
+            >(spaces::layer_locate_spaces_khr)),
             "xrCreateActionSet" => Some(transmute::<
                 xr::pfn::CreateActionSet,
                 xr::pfn::VoidFunction,
@@ -564,15 +588,19 @@ pub unsafe extern "system" fn layer_poll_event(
         }
 
         let res = (inst.next.poll_event)(instance, event_data);
-        if res == xr::Result::SUCCESS && (*event_data).ty == xr::StructureType::EVENT_DATA_SESSION_STATE_CHANGED
+        if res == xr::Result::SUCCESS
+            && (*event_data).ty == xr::StructureType::EVENT_DATA_SESSION_STATE_CHANGED
         {
             let sc = &*(event_data as *const xr::EventDataSessionStateChanged);
             if let Some(sess) = get_session(sc.session) {
                 let mut inner = sess.inner.lock();
                 inner.session_state = sc.state;
                 inner.clock.observe_xr_time(sc.time.as_nanos());
-                if sc.state != xr::SessionState::FOCUSED {
+                if sc.state == xr::SessionState::FOCUSED {
+                    inner.sync_reported_unfocused = false;
+                } else {
                     inner.last_sync_focused = false;
+                    inner.sync_reported_unfocused = true;
                 }
             }
         }
@@ -636,12 +664,12 @@ pub unsafe extern "system" fn layer_destroy_session(session: xr::Session) -> xr:
             return xr::Result::ERROR_HANDLE_INVALID;
         };
 
-        // Remove session reference from instance & prune any remaining spaces tracked on this session.
-        sess.instance
-            .inner
-            .write()
-            .sessions
-            .retain(|&s| s != session.into_raw());
+        // Remove session reference and any stale pending synthetic events from instance.
+        {
+            let mut inst_inner = sess.instance.inner.write();
+            inst_inner.sessions.retain(|&s| s != session.into_raw());
+            inst_inner.prune_session_events(session);
+        }
         {
             let sp_ids: Vec<u64> = sess.inner.lock().spaces.drain(..).collect();
             let mut sp_map = SPACES.write();
@@ -667,6 +695,25 @@ pub unsafe extern "system" fn layer_begin_session(
         };
         let res = (sess.instance.next.begin_session)(session, begin_info);
         if res == xr::Result::SUCCESS {
+            // If hand tracker creation transiently failed during xrCreateSession (e.g., pending
+            // Android runtime permission dialog), lazily retry once on xrBeginSession!
+            let should_retry = {
+                let t = sess.trackers.lock();
+                !t.available
+                    && !t.supports_hand_tracking_known_false
+                    && sess.instance.emulation_enabled()
+            };
+            if should_retry {
+                let new_trackers =
+                    create_session_hand_trackers(&sess.instance, session, sess.system_id);
+                let mut t = sess.trackers.lock();
+                if !t.available {
+                    *t = new_trackers;
+                } else {
+                    drop(t);
+                    destroy_hand_tracker_resources(&sess.instance, new_trackers);
+                }
+            }
             sess.inner.lock().is_running = true;
         }
         res
@@ -680,10 +727,22 @@ pub unsafe extern "system" fn layer_end_session(session: xr::Session) -> xr::Res
         };
         let res = (sess.instance.next.end_session)(session);
         if res == xr::Result::SUCCESS {
+            sess.instance.inner.write().prune_session_events(session);
             let mut inner = sess.inner.lock();
             inner.is_running = false;
             inner.last_sync_focused = false;
+            inner.sync_reported_unfocused = true;
+            inner.active_synced_sets.clear();
+            inner.action_snapshots.clear();
+            inner.sticky_pose_source.clear();
             inner.gesture_engine.reset();
+            inner.pose_synthesizer.reset();
+            inner.last_hand_states = [VirtualHandState::default(); 2];
+            for arb in &mut inner.hand_arb {
+                arb.emulated = false;
+                arb.hand_tracked = false;
+                arb.effective_profile = 0;
+            }
         }
         res
     })
@@ -858,11 +917,12 @@ unsafe fn create_session_hand_trackers(
         },
     };
 
-    if (inst.next.get_system_properties)(inst.handle, system_id, &mut sys_props)
-        != xr::Result::SUCCESS
-        || ht_props.supports_hand_tracking == xr::FALSE
-    {
+    let props_res = (inst.next.get_system_properties)(inst.handle, system_id, &mut sys_props);
+    if props_res != xr::Result::SUCCESS || ht_props.supports_hand_tracking == xr::FALSE {
         log::warn!("System does not report supportsHandTracking=TRUE; entering passthrough mode");
+        if props_res == xr::Result::SUCCESS {
+            res_out.supports_hand_tracking_known_false = true;
+        }
         return res_out;
     }
 
@@ -913,12 +973,8 @@ unsafe fn create_session_hand_trackers(
     res_out
 }
 
-unsafe fn destroy_session_internal_handles(sess: &SessionState) {
-    let taken = {
-        let mut t = sess.trackers.lock();
-        std::mem::take(&mut *t)
-    };
-    if let Some(destroy_ht) = sess.instance.next.destroy_hand_tracker_ext {
+unsafe fn destroy_hand_tracker_resources(inst: &InstanceState, taken: HandTrackerResources) {
+    if let Some(destroy_ht) = inst.next.destroy_hand_tracker_ext {
         if taken.left_tracker != xr::HandTrackerEXT::NULL {
             let _ = destroy_ht(taken.left_tracker);
         }
@@ -927,6 +983,14 @@ unsafe fn destroy_session_internal_handles(sess: &SessionState) {
         }
     }
     if taken.local_space != xr::Space::NULL {
-        let _ = (sess.instance.next.destroy_space)(taken.local_space);
+        let _ = (inst.next.destroy_space)(taken.local_space);
     }
+}
+
+unsafe fn destroy_session_internal_handles(sess: &SessionState) {
+    let taken = {
+        let mut t = sess.trackers.lock();
+        std::mem::take(&mut *t)
+    };
+    destroy_hand_tracker_resources(&sess.instance, taken);
 }

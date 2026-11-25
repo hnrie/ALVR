@@ -5,10 +5,9 @@ use alvr_hand_core::{resolve_binding, HandSide, InteractionProfile, ResolvedBind
 use openxr_sys as xr;
 
 /// Concrete binding entry resolved for an action under a specific interaction profile.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct BoundSource {
     pub binding_path_raw: u64,
-    pub binding_path_str: String,
     pub resolved: ResolvedBinding,
     pub profile: InteractionProfile,
 }
@@ -38,7 +37,7 @@ pub fn select_emulated_profile(inner: &InstanceInner) -> Option<(u64, Interactio
     best
 }
 
-/// Returns all resolved bindings for `action_raw` under `profile_raw` / `profile`,
+/// Returns all resolved bindings for `action_raw` under `profile_raw` / `profile` in `O(bindings_for_action)`,
 /// optionally filtered to a specific `hand_filter` (derived from `subactionPath`).
 pub fn resolve_action_sources(
     inner: &InstanceInner,
@@ -47,15 +46,15 @@ pub fn resolve_action_sources(
     profile: InteractionProfile,
     hand_filter: Option<HandSide>,
 ) -> Vec<BoundSource> {
-    let Some(entries) = inner.suggested_bindings.get(&profile_raw) else {
+    let Some(binding_paths) = inner
+        .bindings_by_profile_action
+        .get(&(profile_raw, action_raw))
+    else {
         return Vec::new();
     };
-    let mut sources = Vec::new();
-    for entry in entries {
-        if entry.action != action_raw {
-            continue;
-        }
-        let Some(path_str) = inner.path_str(entry.binding_path) else {
+    let mut sources = Vec::with_capacity(binding_paths.len());
+    for &binding_path_raw in binding_paths {
+        let Some(path_str) = inner.path_str(binding_path_raw) else {
             continue;
         };
         let Some(resolved) = resolve_binding(profile, path_str) else {
@@ -67,8 +66,7 @@ pub fn resolve_action_sources(
             }
         }
         sources.push(BoundSource {
-            binding_path_raw: entry.binding_path,
-            binding_path_str: path_str.to_owned(),
+            binding_path_raw,
             resolved,
             profile,
         });
