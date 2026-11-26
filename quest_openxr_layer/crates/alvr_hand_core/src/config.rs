@@ -254,6 +254,11 @@ pub struct LayerConfig {
     pub float_to_bool_threshold: f32,
     pub float_to_bool_hysteresis: f32,
     pub physical_controller_grace_ms: u32,
+    /// When `true` (default), hides active optical hand tracking from host-app calls to
+    /// `xrLocateHandJointsEXT` while Touch controller emulation is active so engines like
+    /// Meta XR SDK / `libOVRPlugin.so` and Unity XR Hands stay in Touch controller mode
+    /// instead of switching to Meta's 1-hand gray-pointer bare-hand UI fallback.
+    pub hide_hand_tracking_from_app: bool,
 }
 
 impl Default for LayerConfig {
@@ -265,6 +270,7 @@ impl Default for LayerConfig {
             float_to_bool_threshold: 0.5,
             float_to_bool_hysteresis: 0.05,
             physical_controller_grace_ms: 250,
+            hide_hand_tracking_from_app: true,
         }
     }
 }
@@ -536,6 +542,7 @@ mod tests {
                     float_to_bool_threshold: 0.6,
                     float_to_bool_hysteresis: 0.1,
                     physical_controller_grace_ms: 400,
+                    hide_hand_tracking_from_app: false,
                 };
                 let pretty = custom.to_json_pretty().expect("serialize custom");
                 assert!(
@@ -603,6 +610,7 @@ mod tests {
                 float_to_bool_threshold: f32::NAN,
                 float_to_bool_hysteresis: -0.5,
                 physical_controller_grace_ms: u32::MAX,
+                hide_hand_tracking_from_app: true,
             },
             LayerConfig {
                 enabled: true,
@@ -619,6 +627,7 @@ mod tests {
                 float_to_bool_threshold: 0.0, // <= 0
                 float_to_bool_hysteresis: 0.9,
                 physical_controller_grace_ms: 0,
+                hide_hand_tracking_from_app: false,
             },
             LayerConfig {
                 enabled: true,
@@ -630,6 +639,7 @@ mod tests {
                 float_to_bool_threshold: 1.5, // >= 1
                 float_to_bool_hysteresis: f32::INFINITY,
                 physical_controller_grace_ms: 500,
+                hide_hand_tracking_from_app: true,
             },
         ];
 

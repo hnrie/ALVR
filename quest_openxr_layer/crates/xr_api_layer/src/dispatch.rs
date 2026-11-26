@@ -5,12 +5,13 @@ use crate::android::{android_asset_config, android_config_candidates, init_loggi
 use crate::input;
 use crate::spaces;
 use crate::state::{
-    get_instance, get_session, HandTrackerResources, InstanceInner, InstanceState, NextDispatch,
-    SessionInner, SessionState, ACTION_SETS, ACTIONS, EXT_FB_HAND_TRACKING_AIM, EXT_HAND_TRACKING,
+    get_app_hand_tracker, get_instance, get_session, get_space, AppHandTrackerMeta,
+    HandTrackerResources, InstanceInner, InstanceState, NextDispatch, SessionInner, SessionState,
+    ACTION_SETS, ACTIONS, APP_HAND_TRACKERS, EXT_FB_HAND_TRACKING_AIM, EXT_HAND_TRACKING,
     EXT_KHR_LOCATE_SPACES, INSTANCES, LAYER_NAME, SESSIONS, SPACES,
 };
 use alvr_hand_core::config::{LayerConfig, DISABLE_ENV_VAR};
-use alvr_hand_core::VirtualHandState;
+use alvr_hand_core::{HandSide, VirtualHandState, HAND_JOINT_COUNT};
 use openxr_sys as xr;
 use openxr_sys::Handle;
 use parking_lot::{Mutex, RwLock};
@@ -102,6 +103,19 @@ pub unsafe fn negotiate_loader_api_layer_interface(
     req.layer_api_version = xr::Version::from_raw(clamped_raw);
     req.get_instance_proc_addr = Some(layer_get_instance_proc_addr);
     req.create_api_layer_instance = Some(layer_create_api_layer_instance);
+
+    log::info!(
+        "Negotiated {LAYER_NAME} (loader API {}.{}.{}..={}.{}.{} -> {}.{}.{})",
+        li.min_api_version.major(),
+        li.min_api_version.minor(),
+        li.min_api_version.patch(),
+        li.max_api_version.major(),
+        li.max_api_version.minor(),
+        li.max_api_version.patch(),
+        req.layer_api_version.major(),
+        req.layer_api_version.minor(),
+        req.layer_api_version.patch(),
+    );
 
     xr::Result::SUCCESS
 }
@@ -287,6 +301,20 @@ pub unsafe extern "system" fn layer_create_api_layer_instance(
             right_hand_path,
             inner: RwLock::new(inner),
         });
+
+        log::info!(
+            "Created instance for {LAYER_NAME}: app_api={}.{}.{}, enabled={}, disabled_by_env={}, app_ht={}, layer_ht={}, layer_fb_aim={}, hide_app_ht={}, only_touch={}",
+            state.app_api_version.major(),
+            state.app_api_version.minor(),
+            state.app_api_version.patch(),
+            state.config.enabled,
+            state.disabled_by_env,
+            state.app_enabled_hand_tracking,
+            state.layer_has_hand_tracking,
+            state.layer_has_fb_aim,
+            state.config.hide_hand_tracking_from_app,
+            state.config.gestures.only_touch,
+        );
 
         INSTANCES
             .write()
@@ -501,6 +529,33 @@ pub unsafe extern "system" fn layer_get_instance_proc_addr(
                 xr::pfn::StopHapticFeedback,
                 xr::pfn::VoidFunction,
             >(input::layer_stop_haptic_feedback)),
+            "xrCreateHandTrackerEXT"
+                if inst.app_enabled_hand_tracking
+                    && inst.next.create_hand_tracker_ext.is_some() =>
+            {
+                Some(transmute::<
+                    xr::pfn::CreateHandTrackerEXT,
+                    xr::pfn::VoidFunction,
+                >(layer_create_hand_tracker_ext))
+            }
+            "xrDestroyHandTrackerEXT"
+                if inst.app_enabled_hand_tracking
+                    && inst.next.destroy_hand_tracker_ext.is_some() =>
+            {
+                Some(transmute::<
+                    xr::pfn::DestroyHandTrackerEXT,
+                    xr::pfn::VoidFunction,
+                >(layer_destroy_hand_tracker_ext))
+            }
+            "xrLocateHandJointsEXT"
+                if inst.app_enabled_hand_tracking
+                    && inst.next.locate_hand_joints_ext.is_some() =>
+            {
+                Some(transmute::<
+                    xr::pfn::LocateHandJointsEXT,
+                    xr::pfn::VoidFunction,
+                >(layer_locate_hand_joints_ext))
+            }
             _ => None,
         };
 
@@ -524,10 +579,24 @@ pub unsafe extern "system" fn layer_destroy_instance(instance: xr::Instance) -> 
         for sess_raw in remaining_sessions {
             if let Some(sess) = SESSIONS.write().remove(&sess_raw) {
                 destroy_session_internal_handles(&sess);
-                let sp_ids: Vec<u64> = sess.inner.lock().spaces.clone();
-                let mut sp_map = SPACES.write();
-                for s in sp_ids {
-                    sp_map.remove(&s);
+                let (sp_ids, ht_ids) = {
+                    let mut sinner = sess.inner.lock();
+                    (
+                        sinner.spaces.drain(..).collect::<Vec<_>>(),
+                        sinner.app_hand_trackers.drain(..).collect::<Vec<_>>(),
+                    )
+                };
+                {
+                    let mut sp_map = SPACES.write();
+                    for s in sp_ids {
+                        sp_map.remove(&s);
+                    }
+                }
+                {
+                    let mut ht_map = APP_HAND_TRACKERS.write();
+                    for h in ht_ids {
+                        ht_map.remove(&h);
+                    }
                 }
             }
         }
@@ -671,10 +740,24 @@ pub unsafe extern "system" fn layer_destroy_session(session: xr::Session) -> xr:
             inst_inner.prune_session_events(session);
         }
         {
-            let sp_ids: Vec<u64> = sess.inner.lock().spaces.drain(..).collect();
-            let mut sp_map = SPACES.write();
-            for sp in sp_ids {
-                sp_map.remove(&sp);
+            let (sp_ids, ht_ids) = {
+                let mut sinner = sess.inner.lock();
+                (
+                    sinner.spaces.drain(..).collect::<Vec<_>>(),
+                    sinner.app_hand_trackers.drain(..).collect::<Vec<_>>(),
+                )
+            };
+            {
+                let mut sp_map = SPACES.write();
+                for sp in sp_ids {
+                    sp_map.remove(&sp);
+                }
+            }
+            {
+                let mut ht_map = APP_HAND_TRACKERS.write();
+                for ht in ht_ids {
+                    ht_map.remove(&ht);
+                }
             }
         }
 
@@ -919,7 +1002,10 @@ unsafe fn create_session_hand_trackers(
 
     let props_res = (inst.next.get_system_properties)(inst.handle, system_id, &mut sys_props);
     if props_res != xr::Result::SUCCESS || ht_props.supports_hand_tracking == xr::FALSE {
-        log::warn!("System does not report supportsHandTracking=TRUE; entering passthrough mode");
+        log::warn!(
+            "System does not report supportsHandTracking=TRUE (res={props_res:?}, supports={}); entering passthrough mode",
+            ht_props.supports_hand_tracking != xr::FALSE
+        );
         if props_res == xr::Result::SUCCESS {
             res_out.supports_hand_tracking_known_false = true;
         }
@@ -934,9 +1020,9 @@ unsafe fn create_session_hand_trackers(
         pose_in_reference_space: xr::Posef::IDENTITY,
     };
     let mut local_space = xr::Space::NULL;
-    if (inst.next.create_reference_space)(session, &local_info, &mut local_space)
-        != xr::Result::SUCCESS
-    {
+    let local_res = (inst.next.create_reference_space)(session, &local_info, &mut local_space);
+    if local_res != xr::Result::SUCCESS {
+        log::warn!("Failed to create internal LOCAL space for hand tracking ({local_res:?})");
         return res_out;
     }
 
@@ -948,7 +1034,9 @@ unsafe fn create_session_hand_trackers(
         hand_joint_set: xr::HandJointSetEXT::DEFAULT,
     };
     let mut left_tracker = xr::HandTrackerEXT::NULL;
-    if create_ht(session, &left_info, &mut left_tracker) != xr::Result::SUCCESS {
+    let left_res = create_ht(session, &left_info, &mut left_tracker);
+    if left_res != xr::Result::SUCCESS {
+        log::warn!("Failed to create internal left hand tracker ({left_res:?})");
         let _ = (inst.next.destroy_space)(local_space);
         return res_out;
     }
@@ -960,12 +1048,15 @@ unsafe fn create_session_hand_trackers(
         hand_joint_set: xr::HandJointSetEXT::DEFAULT,
     };
     let mut right_tracker = xr::HandTrackerEXT::NULL;
-    if create_ht(session, &right_info, &mut right_tracker) != xr::Result::SUCCESS {
+    let right_res = create_ht(session, &right_info, &mut right_tracker);
+    if right_res != xr::Result::SUCCESS {
+        log::warn!("Failed to create internal right hand tracker ({right_res:?})");
         let _ = destroy_ht(left_tracker);
         let _ = (inst.next.destroy_space)(local_space);
         return res_out;
     }
 
+    log::info!("Session internal hand trackers ready (left + right XR_EXT_hand_tracking active)");
     res_out.left_tracker = left_tracker;
     res_out.right_tracker = right_tracker;
     res_out.local_space = local_space;
@@ -993,4 +1084,144 @@ unsafe fn destroy_session_internal_handles(sess: &SessionState) {
         std::mem::take(&mut *t)
     };
     destroy_hand_tracker_resources(&sess.instance, taken);
+}
+
+pub unsafe extern "system" fn layer_create_hand_tracker_ext(
+    session: xr::Session,
+    create_info: *const xr::HandTrackerCreateInfoEXT,
+    hand_tracker: *mut xr::HandTrackerEXT,
+) -> xr::Result {
+    crate::ffi_guard(|| {
+        let Some(sess) = get_session(session) else {
+            return xr::Result::ERROR_HANDLE_INVALID;
+        };
+        let Some(create_fn) = sess.instance.next.create_hand_tracker_ext else {
+            return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
+        };
+        let res = create_fn(session, create_info, hand_tracker);
+        if res == xr::Result::SUCCESS && !create_info.is_null() && !hand_tracker.is_null() {
+            let handle = *hand_tracker;
+            let raw = handle.into_raw();
+            let hand = if (*create_info).hand == xr::HandEXT::RIGHT {
+                HandSide::Right
+            } else {
+                HandSide::Left
+            };
+            let meta = Arc::new(AppHandTrackerMeta {
+                handle,
+                session: Arc::clone(&sess),
+                hand,
+            });
+            APP_HAND_TRACKERS.write().insert(raw, meta);
+            sess.inner.lock().app_hand_trackers.push(raw);
+            log::info!(
+                "Host app created hand tracker ({hand:?}); hide_hand_tracking_from_app={}",
+                sess.instance.config.hide_hand_tracking_from_app
+            );
+        }
+        res
+    })
+}
+
+pub unsafe extern "system" fn layer_destroy_hand_tracker_ext(
+    hand_tracker: xr::HandTrackerEXT,
+) -> xr::Result {
+    crate::ffi_guard(|| {
+        let Some(meta) = get_app_hand_tracker(hand_tracker) else {
+            return xr::Result::ERROR_HANDLE_INVALID;
+        };
+        let Some(destroy_fn) = meta.session.instance.next.destroy_hand_tracker_ext else {
+            return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
+        };
+        let res = destroy_fn(hand_tracker);
+        if res == xr::Result::SUCCESS {
+            let raw = hand_tracker.into_raw();
+            APP_HAND_TRACKERS.write().remove(&raw);
+            meta.session
+                .inner
+                .lock()
+                .app_hand_trackers
+                .retain(|&h| h != raw);
+        }
+        res
+    })
+}
+
+pub unsafe extern "system" fn layer_locate_hand_joints_ext(
+    hand_tracker: xr::HandTrackerEXT,
+    locate_info: *const xr::HandJointsLocateInfoEXT,
+    locations: *mut xr::HandJointLocationsEXT,
+) -> xr::Result {
+    crate::ffi_guard(|| {
+        if locate_info.is_null() || locations.is_null() {
+            return xr::Result::ERROR_VALIDATION_FAILURE;
+        }
+        let Some(meta) = get_app_hand_tracker(hand_tracker) else {
+            return xr::Result::ERROR_HANDLE_INVALID;
+        };
+        let Some(next_locate) = meta.session.instance.next.locate_hand_joints_ext else {
+            return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
+        };
+
+        let hide = meta.session.instance.emulation_enabled()
+            && meta.session.instance.config.hide_hand_tracking_from_app
+            && meta.session.trackers.lock().available;
+        if !hide {
+            return next_locate(hand_tracker, locate_info, locations);
+        }
+
+        let info = &*locate_info;
+        if info.time.as_nanos() <= 0 {
+            return xr::Result::ERROR_TIME_INVALID;
+        }
+        let valid_base =
+            get_space(info.base_space).is_some_and(|sp| sp.session.handle == meta.session.handle);
+        let loc = &mut *locations;
+        if !valid_base
+            || loc.joint_locations.is_null()
+            || (loc.joint_count as usize) < HAND_JOINT_COUNT
+        {
+            return next_locate(hand_tracker, locate_info, locations);
+        }
+
+        // Hide active bare-hand tracking from host-app calls while Touch controller emulation is
+        // enabled (identical to Quest's own behavior when physical Touch controllers are held),
+        // preventing Meta XR SDK / libOVRPlugin.so / Unity XR Hands from switching out of Touch
+        // controller mode into Meta's 1-hand gray-pointer bare-hand UI fallback.
+        loc.is_active = xr::FALSE;
+        let joints = std::slice::from_raw_parts_mut(loc.joint_locations, loc.joint_count as usize);
+        for j in joints {
+            j.location_flags = xr::SpaceLocationFlags::EMPTY;
+        }
+        clear_hand_location_ext_chain(loc.next);
+        xr::Result::SUCCESS
+    })
+}
+
+unsafe fn clear_hand_location_ext_chain(mut next: *mut c_void) {
+    let mut guard = 0usize;
+    while !next.is_null() && guard < 64 {
+        let header = &*(next as *const xr::BaseOutStructure);
+        if header.ty == xr::StructureType::HAND_TRACKING_AIM_STATE_FB {
+            let aim = &mut *(next as *mut xr::HandTrackingAimStateFB);
+            aim.status = xr::HandTrackingAimFlagsFB::EMPTY;
+            aim.pinch_strength_index = 0.0;
+            aim.pinch_strength_middle = 0.0;
+            aim.pinch_strength_ring = 0.0;
+            aim.pinch_strength_little = 0.0;
+        } else if header.ty == xr::StructureType::HAND_JOINT_VELOCITIES_EXT {
+            let vels = &mut *(next as *mut xr::HandJointVelocitiesEXT);
+            if !vels.joint_velocities.is_null() && vels.joint_count > 0 {
+                let slice = std::slice::from_raw_parts_mut(
+                    vels.joint_velocities,
+                    vels.joint_count as usize,
+                );
+                for v in slice {
+                    v.velocity_flags = xr::SpaceVelocityFlags::EMPTY;
+                }
+            }
+        }
+        next = header.next as *mut c_void;
+        guard += 1;
+    }
 }

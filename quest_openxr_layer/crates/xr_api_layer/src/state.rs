@@ -441,6 +441,13 @@ pub struct SessionInner {
     pub sticky_pose_source: HashMap<(u64, u64), (HandSide, PoseSource)>,
     pub clock: MonotonicXrClock,
     pub spaces: Vec<u64>,
+    pub app_hand_trackers: Vec<u64>,
+    /// Last logged arbitration tuple `(emulated, physical_active, hand_tracked, runtime_profile, effective_profile)` per hand.
+    pub last_logged_arb: [Option<(bool, bool, bool, u64, u64)>; 2],
+    /// Last logged `xrLocateHandJointsEXT` error per hand (prevents per-frame log spam).
+    pub last_locate_err: [Option<xr::Result>; 2],
+    /// Ensures the missing-supported-profile warning logs at most once per session.
+    pub warned_no_supported_profile: bool,
 }
 
 impl SessionInner {
@@ -463,6 +470,10 @@ impl SessionInner {
             sticky_pose_source: HashMap::new(),
             clock: MonotonicXrClock::new(),
             spaces: Vec::new(),
+            app_hand_trackers: Vec::new(),
+            last_logged_arb: [None, None],
+            last_locate_err: [None, None],
+            warned_no_supported_profile: false,
         }
     }
 
@@ -482,6 +493,13 @@ impl SessionInner {
         self.prev_action_values.retain(|&(a, _), _| a != action_raw);
         self.sticky_pose_source.retain(|&(a, _), _| a != action_raw);
     }
+}
+
+/// Metadata tracked for each host-app-created `XrHandTrackerEXT`.
+pub struct AppHandTrackerMeta {
+    pub handle: xr::HandTrackerEXT,
+    pub session: Arc<SessionState>,
+    pub hand: HandSide,
 }
 
 /// State associated with one `XrSession`.
@@ -504,6 +522,8 @@ pub static ACTIONS: LazyLock<RwLock<HashMap<u64, Arc<ActionMeta>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static SPACES: LazyLock<RwLock<HashMap<u64, Arc<SpaceMeta>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+pub static APP_HAND_TRACKERS: LazyLock<RwLock<HashMap<u64, Arc<AppHandTrackerMeta>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn get_instance(handle: xr::Instance) -> Option<Arc<InstanceState>> {
     INSTANCES.read().get(&handle.into_raw()).cloned()
@@ -523,6 +543,10 @@ pub fn get_action(handle: xr::Action) -> Option<Arc<ActionMeta>> {
 
 pub fn get_space(handle: xr::Space) -> Option<Arc<SpaceMeta>> {
     SPACES.read().get(&handle.into_raw()).cloned()
+}
+
+pub fn get_app_hand_tracker(handle: xr::HandTrackerEXT) -> Option<Arc<AppHandTrackerMeta>> {
+    APP_HAND_TRACKERS.read().get(&handle.into_raw()).cloned()
 }
 
 #[cfg(test)]

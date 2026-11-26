@@ -249,9 +249,22 @@ pub unsafe extern "system" fn layer_suggest_interaction_profile_bindings(
         }
 
         // OpenXR spec (`input.adoc:566-569`): repeat suggestion for same profile REPLACES prior bindings.
-        inst.inner
-            .write()
-            .set_suggested_bindings(sb.interaction_profile.into_raw(), entries);
+        let profile_raw = sb.interaction_profile.into_raw();
+        let binding_count = entries.len();
+        let profile_name = {
+            let mut inner = inst.inner.write();
+            inner.set_suggested_bindings(profile_raw, entries);
+            inner
+                .path_str(profile_raw)
+                .unwrap_or("<unknown>")
+                .to_owned()
+        };
+        log::info!(
+            "App suggested interaction profile '{}' ({} bindings, supported={})",
+            profile_name,
+            binding_count,
+            InteractionProfile::from_path(&profile_name).is_some()
+        );
 
         xr::Result::SUCCESS
     })
@@ -414,7 +427,30 @@ pub unsafe extern "system" fn layer_sync_actions(
                 &mut st,
             );
             if p_res == xr::Result::SUCCESS {
+                ensure_path_cached(&inst, st.interaction_profile);
                 runtime_profiles[hand.index()] = st.interaction_profile.into_raw();
+            }
+        }
+
+        // Classify downstream runtime profiles:
+        // - Hand-interaction profiles (`*hand_interaction*`: ext/hand_interaction_ext,
+        //   microsoft/hand_interaction, fb/hand_interaction, meta/hand_interaction*) represent
+        //   optical bare hands, NEVER physical Touch controllers!
+        // - `/interaction_profiles/khr/simple_controller` when the app also suggested a Touch
+        //   profile is Meta Quest's bare-hand pointer fallback whenever optical hands are tracked.
+        let mut runtime_is_hand_profile = [false; 2];
+        let mut runtime_is_khr_simple_fallback = [false; 2];
+        {
+            let inst_inner = inst.inner.read();
+            let prefers_touch = preferred_profile.is_some_and(|(_, p)| p.is_touch_family());
+            for idx in 0..2 {
+                if let Some(pstr) = inst_inner.path_str(runtime_profiles[idx]) {
+                    if is_hand_interaction_profile(pstr) {
+                        runtime_is_hand_profile[idx] = true;
+                    } else if prefers_touch && pstr == InteractionProfile::KhrSimple.as_path() {
+                        runtime_is_khr_simple_fallback[idx] = true;
+                    }
+                }
             }
         }
 
@@ -475,6 +511,10 @@ pub unsafe extern "system" fn layer_sync_actions(
                 let act_raw = act.handle.into_raw();
                 for hand in [HandSide::Left, HandSide::Right] {
                     let h_idx = hand.index();
+                    if runtime_is_hand_profile[h_idx] {
+                        // Active hand-interaction profile is optical bare hands, not a physical controller.
+                        continue;
+                    }
                     let hand_path_raw = inst.hand_user_path(hand).into_raw();
                     let mut bound_to_hand = false;
                     let mut bound_only_to_this_hand = false;
@@ -544,10 +584,16 @@ pub unsafe extern "system" fn layer_sync_actions(
             }
         }
 
+        let phys_runtime_profiles = [
+            if runtime_is_hand_profile[0] { 0 } else { runtime_profiles[0] },
+            if runtime_is_hand_profile[1] { 0 } else { runtime_profiles[1] },
+        ];
         let mut physical_active = [false; 2];
         for hand in [HandSide::Left, HandSide::Right] {
             let idx = hand.index();
-            physical_active[idx] = if hand_physical_action_active[idx] {
+            physical_active[idx] = if runtime_is_hand_profile[idx] {
+                false
+            } else if hand_physical_action_active[idx] {
                 true
             } else if hand_has_direct_bound_action[idx] {
                 // Direct actions for this hand WERE synced and ALL returned isActive == FALSE.
@@ -556,14 +602,14 @@ pub unsafe extern "system" fn layer_sync_actions(
                 // Only shared actions bound to both hands exist:
                 // - If ALL shared actions returned isActive == FALSE, physical controller is definitely inactive
                 //   (even if Quest kept a dormant runtime interaction profile path!).
-                // - If a shared action returned isActive == TRUE, trust runtime_profiles[idx] != 0
-                //   (or both hands if runtime reported no profile).
+                // - If a shared action returned isActive == TRUE, trust phys_runtime_profiles[idx] != 0
+                //   (or both hands if runtime reported no physical profile).
                 hand_shared_any_active[idx]
-                    && (runtime_profiles[idx] != 0
-                        || (runtime_profiles[0] == 0 && runtime_profiles[1] == 0))
+                    && (phys_runtime_profiles[idx] != 0
+                        || (phys_runtime_profiles[0] == 0 && phys_runtime_profiles[1] == 0))
             } else {
-                // No actions bound to this hand were synced; trust runtime's active interaction profile.
-                runtime_profiles[idx] != 0
+                // No actions bound to this hand were synced; trust runtime's active physical profile.
+                phys_runtime_profiles[idx] != 0
             };
         }
 
@@ -577,22 +623,48 @@ pub unsafe extern "system" fn layer_sync_actions(
         };
 
         // Locate both hands via XR_EXT_hand_tracking (NO locks held!).
+        // Also query hands when Quest fell back to `khr/simple_controller` despite a Touch profile
+        // being suggested: if optical hands are actively tracked, override Quest's pinch-only fallback!
         let query_time = xr::Time::from_nanos(xr_time_ns);
-        let located_left: Option<LocatedHand> = if !physical_active[0] {
-            locate_hand_joints(&inst, left_tracker, local_space, query_time, false, false)
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let located_right: Option<LocatedHand> = if !physical_active[1] {
-            locate_hand_joints(&inst, right_tracker, local_space, query_time, false, false)
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        let mut locate_errs: [Option<xr::Result>; 2] = [None, None];
+        let located_left: Option<LocatedHand> =
+            if !physical_active[0] || runtime_is_khr_simple_fallback[0] {
+                match locate_hand_joints(&inst, left_tracker, local_space, query_time, false, false)
+                {
+                    Ok(opt) => opt,
+                    Err(err) => {
+                        locate_errs[0] = Some(err);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        let located_right: Option<LocatedHand> =
+            if !physical_active[1] || runtime_is_khr_simple_fallback[1] {
+                match locate_hand_joints(
+                    &inst,
+                    right_tracker,
+                    local_space,
+                    query_time,
+                    false,
+                    false,
+                ) {
+                    Ok(opt) => opt,
+                    Err(err) => {
+                        locate_errs[1] = Some(err);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let located = [located_left, located_right];
+        for idx in 0..2 {
+            if runtime_is_khr_simple_fallback[idx] && located[idx].is_some() {
+                physical_active[idx] = false;
+            }
+        }
 
         // Resolve bindings table snapshot under `inst.inner` read lock BEFORE locking `sess.inner`
         // (preserves strict lock ordering: never nest `inst.inner` inside `sess.inner`!).
@@ -644,13 +716,32 @@ pub unsafe extern "system" fn layer_sync_actions(
         }
 
         // Update session state, arbitration, gesture engine, and freeze atomic action snapshots!
-        let queue_profile_changed = {
+        let (queue_profile_changed, warn_no_profile, arb_logs, err_logs) = {
             let mut inner = sess.inner.lock();
             inner.last_sync_focused = true;
             inner.sync_reported_unfocused = false;
             inner.active_synced_sets = active_sets.clone();
 
+            let warn_no_profile = if preferred_profile.is_none() && !inner.warned_no_supported_profile
+            {
+                inner.warned_no_supported_profile = true;
+                true
+            } else {
+                false
+            };
+
+            let mut err_logs: [Option<xr::Result>; 2] = [None, None];
+            for idx in 0..2 {
+                if inner.last_locate_err[idx] != locate_errs[idx] {
+                    inner.last_locate_err[idx] = locate_errs[idx];
+                    if locate_errs[idx].is_some() {
+                        err_logs[idx] = locate_errs[idx];
+                    }
+                }
+            }
+
             let mut profile_changed = false;
+            let mut arb_logs: [Option<(bool, bool, bool, u64, u64)>; 2] = [None, None];
             for hand in [HandSide::Left, HandSide::Right] {
                 let idx = hand.index();
                 let prev_effective = inner.hand_arb[idx].effective_profile;
@@ -701,6 +792,18 @@ pub unsafe extern "system" fn layer_sync_actions(
                 inner.hand_arb[idx].effective_profile = new_effective;
                 if new_effective != prev_effective && inner.is_running {
                     profile_changed = true;
+                }
+
+                let tuple = (
+                    inner.hand_arb[idx].emulated,
+                    physical_active[idx],
+                    inner.hand_arb[idx].hand_tracked,
+                    runtime_profiles[idx],
+                    new_effective,
+                );
+                if inner.last_logged_arb[idx] != Some(tuple) {
+                    inner.last_logged_arb[idx] = Some(tuple);
+                    arb_logs[idx] = Some(tuple);
                 }
             }
 
@@ -809,8 +912,31 @@ pub unsafe extern "system" fn layer_sync_actions(
                 .retain(|k, _| synced_keys.contains(k));
 
             inner.action_snapshots = new_snapshots;
-            profile_changed
+            (profile_changed, warn_no_profile, arb_logs, err_logs)
         };
+
+        if warn_no_profile {
+            log::warn!(
+                "No supported Touch or KHR Simple interaction profile was suggested by the app; emulation inactive"
+            );
+        }
+        for hand in [HandSide::Left, HandSide::Right] {
+            if let Some(err) = err_logs[hand.index()] {
+                log::warn!("xrLocateHandJointsEXT({hand:?}) failed: {err:?}");
+            }
+        }
+        if arb_logs[0].is_some() || arb_logs[1].is_some() {
+            let inst_inner = inst.inner.read();
+            for hand in [HandSide::Left, HandSide::Right] {
+                if let Some((emulated, phys, tracked, rt_prof, eff_prof)) = arb_logs[hand.index()] {
+                    let rt_str = inst_inner.path_str(rt_prof).unwrap_or("<none>");
+                    let eff_str = inst_inner.path_str(eff_prof).unwrap_or("<none>");
+                    log::info!(
+                        "Hand {hand:?} arbitration: emulated={emulated}, physical={phys}, hand_tracked={tracked}, runtime_profile='{rt_str}', effective_profile='{eff_str}'"
+                    );
+                }
+            }
+        }
 
         if queue_profile_changed {
             inst.inner.write().queue_profile_changed(session);
@@ -1339,6 +1465,14 @@ pub unsafe extern "system" fn layer_stop_haptic_feedback(
 
         xr::Result::SUCCESS
     })
+}
+
+/// Returns `true` when `profile_path` represents an optical bare-hand interaction profile
+/// (e.g. `XR_EXT_hand_interaction`, `XR_MSFT_hand_interaction`, `XR_FB_hand_tracking_aim`/Meta
+/// hand interaction) rather than a physical hardware controller.
+#[inline]
+pub(crate) fn is_hand_interaction_profile(profile_path: &str) -> bool {
+    profile_path.contains("hand_interaction")
 }
 
 fn ensure_path_cached(inst: &crate::state::InstanceState, path: xr::Path) {

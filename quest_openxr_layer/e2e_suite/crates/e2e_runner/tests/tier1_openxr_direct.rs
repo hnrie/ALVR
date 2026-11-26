@@ -1477,4 +1477,405 @@ fn t1_openxr_1_0_gates_locate_spaces_and_unfocused_haptics_and_end_session_event
     app.destroy();
 }
 
+#[test]
+fn t1_quest_hand_interaction_profile_overridden_by_touch_emulation() {
+    let _g = HARNESS_LOCK.lock();
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h = DirectLayerHarness::load().unwrap();
+    let app = XrApp::new(h, xr::Version::new(1, 0, 0), &["XR_MND_headless"]);
+
+    let aim_pose = app.create_action(
+        "aim_pose",
+        xr::ActionType::POSE_INPUT,
+        &[app.left_user, app.right_user],
+    );
+    let trig = app.create_action(
+        "trig",
+        xr::ActionType::FLOAT_INPUT,
+        &[app.left_user, app.right_user],
+    );
+    let select = app.create_action(
+        "select",
+        xr::ActionType::BOOLEAN_INPUT,
+        &[app.left_user, app.right_user],
+    );
+    let btn_x = app.create_action("btn_x", xr::ActionType::BOOLEAN_INPUT, &[app.left_user]);
+    let btn_a = app.create_action("btn_a", xr::ActionType::BOOLEAN_INPUT, &[app.right_user]);
+    let grip = app.create_action(
+        "grip",
+        xr::ActionType::FLOAT_INPUT,
+        &[app.left_user, app.right_user],
+    );
+
+    // App suggests BOTH Oculus Touch AND XR_EXT_hand_interaction (common on Quest Unity/Unreal/Godot apps).
+    app.suggest(
+        "/interaction_profiles/oculus/touch_controller",
+        &[
+            (aim_pose, "/user/hand/left/input/aim/pose"),
+            (aim_pose, "/user/hand/right/input/aim/pose"),
+            (trig, "/user/hand/left/input/trigger/value"),
+            (trig, "/user/hand/right/input/trigger/value"),
+            (select, "/user/hand/left/input/trigger/click"),
+            (select, "/user/hand/right/input/trigger/click"),
+            (btn_x, "/user/hand/left/input/x/click"),
+            (btn_a, "/user/hand/right/input/a/click"),
+            (grip, "/user/hand/left/input/squeeze/value"),
+            (grip, "/user/hand/right/input/squeeze/value"),
+        ],
+    );
+    app.suggest(
+        "/interaction_profiles/ext/hand_interaction_ext",
+        &[
+            (aim_pose, "/user/hand/left/input/aim/pose"),
+            (aim_pose, "/user/hand/right/input/aim/pose"),
+            (select, "/user/hand/right/input/pinch_ext/value"),
+        ],
+    );
+    app.attach_and_begin();
+
+    // Simulate Meta Quest Horizon OS activating `/interaction_profiles/ext/hand_interaction_ext`
+    // with downstream isActive=TRUE (right pinch only, left ray gray/inactive click, no buttons/grip).
+    let mut hand_int_l = MockPhysicalControllerState::default();
+    hand_int_l.active = true;
+    hand_int_l.interaction_profile =
+        Some("/interaction_profiles/ext/hand_interaction_ext".to_string());
+    let mut hand_int_r = hand_int_l.clone();
+    hand_int_r.select_click = true;
+    global_engine().set_physical_controller(0, hand_int_l);
+    global_engine().set_physical_controller(1, hand_int_r);
+
+    // Optical bare hands are tracked: left hand pinches index (trigger) & curls grip;
+    // right hand pinches ring (A button) & index (trigger).
+    global_engine().set_hand_state(
+        0,
+        HandSkeletonBuilder::open(0, Vec3::new(-0.2, 1.1, -0.3), Quat::IDENTITY)
+            .with_pinch(10, 0.0)
+            .with_grip_curl()
+            .build(),
+    );
+    global_engine().set_hand_state(
+        1,
+        HandSkeletonBuilder::open(1, Vec3::new(0.2, 1.1, -0.3), Quat::IDENTITY)
+            .with_pinch(20, 0.0)
+            .build(),
+    );
+
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    advance_dual_clock_ms(65);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+
+    let touch_path = app.path("/interaction_profiles/oculus/touch_controller");
+    assert_eq!(
+        app.get_profile(app.left_user),
+        touch_path,
+        "left hand must override ext/hand_interaction_ext with Oculus Touch"
+    );
+    assert_eq!(
+        app.get_profile(app.right_user),
+        touch_path,
+        "right hand must override ext/hand_interaction_ext with Oculus Touch"
+    );
+
+    // Left hand trigger click + float AND grip work (not gray/click-disabled)!
+    assert_eq!(app.get_bool(select, app.left_user).is_active, xr::TRUE);
+    assert_eq!(app.get_bool(select, app.left_user).current_state, xr::TRUE);
+    assert!((app.get_float(trig, app.left_user).current_state - 1.0).abs() < 1e-3);
+    assert!((app.get_float(grip, app.left_user).current_state - 1.0).abs() < 1e-3);
+
+    // Right hand A button works (not just right click)!
+    assert_eq!(app.get_bool(btn_a, app.right_user).is_active, xr::TRUE);
+    assert_eq!(app.get_bool(btn_a, app.right_user).current_state, xr::TRUE);
+    // Left X button is active (unpressed)
+    assert_eq!(app.get_bool(btn_x, app.left_user).is_active, xr::TRUE);
+    assert_eq!(app.get_bool(btn_x, app.left_user).current_state, xr::FALSE);
+
+    app.destroy();
+}
+
+#[test]
+fn t1_quest_khr_simple_hand_pointer_fallback_override() {
+    let _g = HARNESS_LOCK.lock();
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h = DirectLayerHarness::load().unwrap();
+    let app = XrApp::new(h, xr::Version::new(1, 0, 0), &["XR_MND_headless"]);
+
+    let select = app.create_action(
+        "select",
+        xr::ActionType::BOOLEAN_INPUT,
+        &[app.left_user, app.right_user],
+    );
+    let grip = app.create_action(
+        "grip",
+        xr::ActionType::FLOAT_INPUT,
+        &[app.left_user, app.right_user],
+    );
+
+    // App suggests Oculus Touch + KHR Simple fallback.
+    app.suggest(
+        "/interaction_profiles/oculus/touch_controller",
+        &[
+            (select, "/user/hand/left/input/trigger/click"),
+            (select, "/user/hand/right/input/trigger/click"),
+            (grip, "/user/hand/left/input/squeeze/value"),
+            (grip, "/user/hand/right/input/squeeze/value"),
+        ],
+    );
+    app.suggest(
+        "/interaction_profiles/khr/simple_controller",
+        &[
+            (select, "/user/hand/left/input/select/click"),
+            (select, "/user/hand/right/input/select/click"),
+        ],
+    );
+    app.attach_and_begin();
+
+    // Downstream falls back to khr/simple_controller while bare hands ARE tracked!
+    let mut simple_fb = MockPhysicalControllerState::default();
+    simple_fb.active = true;
+    simple_fb.interaction_profile =
+        Some("/interaction_profiles/khr/simple_controller".to_string());
+    simple_fb.select_click = false;
+    global_engine().set_physical_controller(0, simple_fb.clone());
+    global_engine().set_physical_controller(1, simple_fb.clone());
+
+    global_engine().set_hand_state(
+        0,
+        HandSkeletonBuilder::open(0, Vec3::ZERO, Quat::IDENTITY)
+            .with_grip_curl()
+            .build(),
+    );
+    global_engine().set_hand_state(
+        1,
+        HandSkeletonBuilder::open(1, Vec3::ZERO, Quat::IDENTITY)
+            .with_pinch(10, 0.0)
+            .build(),
+    );
+
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    advance_dual_clock_ms(65);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+
+    let touch_path = app.path("/interaction_profiles/oculus/touch_controller");
+    let simple_path = app.path("/interaction_profiles/khr/simple_controller");
+    assert_eq!(app.get_profile(app.left_user), touch_path);
+    assert_eq!(app.get_profile(app.right_user), touch_path);
+    assert!((app.get_float(grip, app.left_user).current_state - 1.0).abs() < 1e-3);
+    assert_eq!(app.get_bool(select, app.right_user).current_state, xr::TRUE);
+
+    // If optical hands disappear while a real generic khr/simple_controller remains active,
+    // pass through cleanly to khr/simple_controller!
+    global_engine().set_hand_state(0, MockHandState::default());
+    global_engine().set_hand_state(1, MockHandState::default());
+    let mut simple_pressed = simple_fb;
+    simple_pressed.select_click = true;
+    global_engine().set_physical_controller(0, simple_pressed);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    assert_eq!(app.get_profile(app.left_user), simple_path);
+    assert_eq!(app.get_bool(select, app.left_user).current_state, xr::TRUE);
+
+    app.destroy();
+}
+
+#[test]
+fn t1_host_app_hand_tracking_hidden_by_default_and_configurable() {
+    let _g = HARNESS_LOCK.lock();
+
+    // Case 1: Default config (`hide_hand_tracking_from_app: true`) hides raw hand tracking
+    // from host-app calls to `xrLocateHandJointsEXT` while Touch emulation stays 100% active.
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h = DirectLayerHarness::load().unwrap();
+    let app = XrApp::new(
+        h,
+        xr::Version::new(1, 0, 0),
+        &[
+            "XR_MND_headless",
+            "XR_EXT_hand_tracking",
+            "XR_FB_hand_tracking_aim",
+        ],
+    );
+    let trig = app.create_action("trig", xr::ActionType::FLOAT_INPUT, &[app.left_user]);
+    app.suggest(
+        "/interaction_profiles/oculus/touch_controller",
+        &[(trig, "/user/hand/left/input/trigger/value")],
+    );
+    app.attach_and_begin();
+
+    let mut left_hand = HandSkeletonBuilder::open(0, Vec3::new(-0.2, 1.1, -0.3), Quat::IDENTITY)
+        .with_pinch(10, 0.0)
+        .build();
+    left_hand.aim = Some(mock_xr_core::MockAimInput {
+        status: (xr::HandTrackingAimFlagsFB::COMPUTED
+            | xr::HandTrackingAimFlagsFB::VALID
+            | xr::HandTrackingAimFlagsFB::DOMINANT_HAND)
+            .into_raw(),
+        aim_pose: MockPose::IDENTITY,
+        pinch_strength_index: 1.0,
+        pinch_strength_middle: 0.0,
+        pinch_strength_ring: 0.0,
+        pinch_strength_little: 0.0,
+    });
+    global_engine().set_hand_state(0, left_hand.clone());
+
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+    advance_dual_clock_ms(65);
+    assert_eq!(app.sync(), xr::Result::SUCCESS);
+
+    // Emulated Touch trigger is active and 1.0!
+    assert_eq!(app.get_float(trig, app.left_user).is_active, xr::TRUE);
+    assert!((app.get_float(trig, app.left_user).current_state - 1.0).abs() < 1e-3);
+
+    unsafe {
+        let create_ht: xr::pfn::CreateHandTrackerEXT =
+            app.h.pfn(app.inst, "xrCreateHandTrackerEXT").unwrap();
+        let destroy_ht: xr::pfn::DestroyHandTrackerEXT =
+            app.h.pfn(app.inst, "xrDestroyHandTrackerEXT").unwrap();
+        let locate_ht: xr::pfn::LocateHandJointsEXT =
+            app.h.pfn(app.inst, "xrLocateHandJointsEXT").unwrap();
+
+        let htci = xr::HandTrackerCreateInfoEXT {
+            ty: xr::StructureType::HAND_TRACKER_CREATE_INFO_EXT,
+            next: std::ptr::null(),
+            hand: xr::HandEXT::LEFT,
+            hand_joint_set: xr::HandJointSetEXT::DEFAULT,
+        };
+        let mut tracker = xr::HandTrackerEXT::NULL;
+        assert_eq!(create_ht(app.sess, &htci, &mut tracker), xr::Result::SUCCESS);
+
+        let mut aim = xr::HandTrackingAimStateFB {
+            ty: xr::StructureType::HAND_TRACKING_AIM_STATE_FB,
+            next: std::ptr::null_mut(),
+            status: xr::HandTrackingAimFlagsFB::DOMINANT_HAND,
+            aim_pose: xr::Posef::IDENTITY,
+            pinch_strength_index: 0.9,
+            pinch_strength_middle: 0.0,
+            pinch_strength_ring: 0.0,
+            pinch_strength_little: 0.0,
+        };
+        let mut joints = [xr::HandJointLocationEXT {
+            location_flags: xr::SpaceLocationFlags::POSITION_VALID,
+            pose: xr::Posef::IDENTITY,
+            radius: 0.0,
+        }; 26];
+        let li = xr::HandJointsLocateInfoEXT {
+            ty: xr::StructureType::HAND_JOINTS_LOCATE_INFO_EXT,
+            next: std::ptr::null(),
+            base_space: app.local_space,
+            time: xr::Time::from_nanos(global_engine().current_time_ns()),
+        };
+        let mut locs = xr::HandJointLocationsEXT {
+            ty: xr::StructureType::HAND_JOINT_LOCATIONS_EXT,
+            next: &mut aim as *mut _ as *mut c_void,
+            is_active: xr::TRUE,
+            joint_count: 26,
+            joint_locations: joints.as_mut_ptr(),
+        };
+        assert_eq!(locate_ht(tracker, &li, &mut locs), xr::Result::SUCCESS);
+        assert_eq!(
+            locs.is_active,
+            xr::FALSE,
+            "default hide_hand_tracking_from_app must report isActive=FALSE to host app"
+        );
+        assert_eq!(aim.status, xr::HandTrackingAimFlagsFB::EMPTY);
+        assert_eq!(aim.pinch_strength_index, 0.0);
+        assert_eq!(joints[0].location_flags, xr::SpaceLocationFlags::EMPTY);
+
+        assert_eq!(destroy_ht(tracker), xr::Result::SUCCESS);
+    }
+    app.destroy();
+
+    // Case 2: Config `hide_hand_tracking_from_app: false` passes raw hand joints through to host app!
+    let cfg_path = std::env::temp_dir().join(format!(
+        "alvr_hide_ht_false_{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&cfg_path, r#"{"hide_hand_tracking_from_app": false}"#).unwrap();
+    unsafe {
+        std::env::set_var("ALVR_HAND_LAYER_CONFIG", &cfg_path);
+    }
+
+    reset_mock_runtime(MockRuntimeConfig::default());
+    let h2 = DirectLayerHarness::load().unwrap();
+    let app2 = XrApp::new(
+        h2,
+        xr::Version::new(1, 0, 0),
+        &[
+            "XR_MND_headless",
+            "XR_EXT_hand_tracking",
+            "XR_FB_hand_tracking_aim",
+        ],
+    );
+    unsafe {
+        std::env::remove_var("ALVR_HAND_LAYER_CONFIG");
+    }
+    let _ = std::fs::remove_file(&cfg_path);
+
+    let trig2 = app2.create_action("trig", xr::ActionType::FLOAT_INPUT, &[app2.left_user]);
+    app2.suggest(
+        "/interaction_profiles/oculus/touch_controller",
+        &[(trig2, "/user/hand/left/input/trigger/value")],
+    );
+    app2.attach_and_begin();
+    global_engine().set_hand_state(0, left_hand);
+    assert_eq!(app2.sync(), xr::Result::SUCCESS);
+
+    unsafe {
+        let create_ht: xr::pfn::CreateHandTrackerEXT =
+            app2.h.pfn(app2.inst, "xrCreateHandTrackerEXT").unwrap();
+        let destroy_ht: xr::pfn::DestroyHandTrackerEXT =
+            app2.h.pfn(app2.inst, "xrDestroyHandTrackerEXT").unwrap();
+        let locate_ht: xr::pfn::LocateHandJointsEXT =
+            app2.h.pfn(app2.inst, "xrLocateHandJointsEXT").unwrap();
+
+        let htci = xr::HandTrackerCreateInfoEXT {
+            ty: xr::StructureType::HAND_TRACKER_CREATE_INFO_EXT,
+            next: std::ptr::null(),
+            hand: xr::HandEXT::LEFT,
+            hand_joint_set: xr::HandJointSetEXT::DEFAULT,
+        };
+        let mut tracker = xr::HandTrackerEXT::NULL;
+        assert_eq!(
+            create_ht(app2.sess, &htci, &mut tracker),
+            xr::Result::SUCCESS
+        );
+        let mut aim = xr::HandTrackingAimStateFB {
+            ty: xr::StructureType::HAND_TRACKING_AIM_STATE_FB,
+            next: std::ptr::null_mut(),
+            status: xr::HandTrackingAimFlagsFB::EMPTY,
+            aim_pose: xr::Posef::IDENTITY,
+            pinch_strength_index: 0.0,
+            pinch_strength_middle: 0.0,
+            pinch_strength_ring: 0.0,
+            pinch_strength_little: 0.0,
+        };
+        let mut joints = [xr::HandJointLocationEXT {
+            location_flags: xr::SpaceLocationFlags::EMPTY,
+            pose: xr::Posef::IDENTITY,
+            radius: 0.0,
+        }; 26];
+        let li = xr::HandJointsLocateInfoEXT {
+            ty: xr::StructureType::HAND_JOINTS_LOCATE_INFO_EXT,
+            next: std::ptr::null(),
+            base_space: app2.local_space,
+            time: xr::Time::from_nanos(global_engine().current_time_ns()),
+        };
+        let mut locs = xr::HandJointLocationsEXT {
+            ty: xr::StructureType::HAND_JOINT_LOCATIONS_EXT,
+            next: &mut aim as *mut _ as *mut c_void,
+            is_active: xr::FALSE,
+            joint_count: 26,
+            joint_locations: joints.as_mut_ptr(),
+        };
+        assert_eq!(locate_ht(tracker, &li, &mut locs), xr::Result::SUCCESS);
+        assert_eq!(
+            locs.is_active,
+            xr::TRUE,
+            "hide_hand_tracking_from_app=false must pass raw hand joints through"
+        );
+        assert!(aim.status.contains(xr::HandTrackingAimFlagsFB::VALID));
+        assert_eq!(destroy_ht(tracker), xr::Result::SUCCESS);
+    }
+    app2.destroy();
+}
+
+
 

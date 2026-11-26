@@ -116,7 +116,8 @@ cat > "${DIST_DIR}/alvr_hand_controller.default.json" <<'EOF'
   },
   "float_to_bool_threshold": 0.5,
   "float_to_bool_hysteresis": 0.05,
-  "physical_controller_grace_ms": 250
+  "physical_controller_grace_ms": 250,
+  "hide_hand_tracking_from_app": true
 }
 EOF
 

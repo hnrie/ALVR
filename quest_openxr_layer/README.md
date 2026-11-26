@@ -136,7 +136,8 @@ adb push dist/alvr_hand_controller.default.json \
 ```
 
 To disable the implicit layer at runtime, set `DISABLE_XR_APILAYER_ALVR_HAND_EMULATION=1`.
-Inspect layer logs on Quest via:
+By default, `"hide_hand_tracking_from_app": true` hides raw `xrLocateHandJointsEXT` activity from the host app while Touch emulation is active so Meta XR SDK (`libOVRPlugin.so`) / Unity XR Hands apps stay in Touch controller mode instead of switching to Meta's 1-hand gray-pointer bare-hand UI fallback (set to `false` if you want the app to receive raw hand joints simultaneously).
+Inspect layer startup and per-hand arbitration logs on Quest via:
 
 ```bash
 adb logcat -s ALVRHandLayer:V OpenXR-Loader:V

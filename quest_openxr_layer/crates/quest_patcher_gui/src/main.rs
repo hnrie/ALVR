@@ -87,6 +87,7 @@ struct PatcherApp {
     custom_config_path: String,
     preset_pose_mode: PoseProfileMode,
     preset_only_touch: bool,
+    preset_hide_app_hand_tracking: bool,
     allow_missing_loader: bool,
 
     // Execution & result state
@@ -131,6 +132,7 @@ impl PatcherApp {
             custom_config_path: String::new(),
             preset_pose_mode: PoseProfileMode::MetaQuestNativeGrip,
             preset_only_touch: false,
+            preset_hide_app_hand_tracking: true,
             allow_missing_loader: false,
             patching: false,
             progress_fraction: 0.0,
@@ -219,6 +221,7 @@ impl PatcherApp {
                 .unwrap_or_default();
                 cfg.pose.mode = self.preset_pose_mode;
                 cfg.gestures.only_touch = self.preset_only_touch;
+                cfg.hide_hand_tracking_from_app = self.preset_hide_app_hand_tracking;
                 match cfg.to_json_pretty() {
                     Ok(s) => Some(s.into_bytes()),
                     Err(e) => {
@@ -834,6 +837,10 @@ impl eframe::App for PatcherApp {
                                                 "Touch-only gestures",
                                             );
                                         });
+                                        ui.checkbox(
+                                            &mut self.preset_hide_app_hand_tracking,
+                                            "Hide raw hand tracking from app (keeps Meta XR / Unity apps in Touch mode instead of gray 1-hand pointer)",
+                                        );
                                     }
                                     ConfigEmbedMode::CustomJsonFile => {
                                         ui.horizontal(|ui| {
